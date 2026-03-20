@@ -114,10 +114,7 @@ impl SemanticAnalyzer {
         // Check for redeclaration in the current scope
         if let Some(scope) = self.scopes.last() {
             if scope.vars.contains_key(name) {
-                self.warn(format!(
-                    "Variable '{}' redeclared in the same scope",
-                    name
-                ));
+                self.warn(format!("Variable '{}' redeclared in the same scope", name));
             }
         }
         if let Some(scope) = self.scopes.last_mut() {
@@ -220,8 +217,7 @@ impl SemanticAnalyzer {
 
     /// Check if a type is a scalar type (integer, pointer, or enum treated as int).
     fn is_scalar_type(ty: &TypeSpec) -> bool {
-        Self::is_integer_type(ty)
-            || matches!(ty, TypeSpec::Pointer(_) | TypeSpec::Enum(_, _))
+        Self::is_integer_type(ty) || matches!(ty, TypeSpec::Pointer(_) | TypeSpec::Enum(_, _))
     }
 
     /// Get the size of a type in bytes.
@@ -239,11 +235,13 @@ impl SemanticAnalyzer {
             TypeSpec::Struct(_, Some(fields)) => {
                 fields.iter().map(|f| Self::size_of(&f.type_spec)).sum()
             }
-            TypeSpec::Union(_, Some(fields)) => {
-                fields.iter().map(|f| Self::size_of(&f.type_spec)).max().unwrap_or(0)
-            }
+            TypeSpec::Union(_, Some(fields)) => fields
+                .iter()
+                .map(|f| Self::size_of(&f.type_spec))
+                .max()
+                .unwrap_or(0),
             TypeSpec::Struct(_, None) | TypeSpec::Union(_, None) => 0, // incomplete type
-            TypeSpec::TypedefName(_) => 4, // unresolved
+            TypeSpec::TypedefName(_) => 4,                             // unresolved
         }
     }
 
@@ -451,8 +449,13 @@ impl SemanticAnalyzer {
                 let right_ty = self.analyze_expr(right);
 
                 match op {
-                    BinOp::Equal | BinOp::NotEqual | BinOp::Less | BinOp::LessEqual
-                    | BinOp::Greater | BinOp::GreaterEqual | BinOp::LogicalAnd
+                    BinOp::Equal
+                    | BinOp::NotEqual
+                    | BinOp::Less
+                    | BinOp::LessEqual
+                    | BinOp::Greater
+                    | BinOp::GreaterEqual
+                    | BinOp::LogicalAnd
                     | BinOp::LogicalOr => TypeSpec::Int, // comparison yields int
 
                     BinOp::Add | BinOp::Sub => {
@@ -469,9 +472,7 @@ impl SemanticAnalyzer {
                     _ => self.promote_types(&left_ty, &right_ty),
                 }
             }
-            Expr::Unary { operand, .. } => {
-                self.analyze_expr(operand)
-            }
+            Expr::Unary { operand, .. } => self.analyze_expr(operand),
             Expr::Assign { target, value } => {
                 let target_ty = self.analyze_expr(target);
                 self.analyze_expr(value);
@@ -489,12 +490,16 @@ impl SemanticAnalyzer {
                         if !func_info.is_variadic && args.len() != func_info.param_count {
                             self.error(format!(
                                 "Function '{}' expects {} arguments, got {}",
-                                name, func_info.param_count, args.len()
+                                name,
+                                func_info.param_count,
+                                args.len()
                             ));
                         } else if func_info.is_variadic && args.len() < func_info.param_count {
                             self.error(format!(
                                 "Function '{}' expects at least {} arguments, got {}",
-                                name, func_info.param_count, args.len()
+                                name,
+                                func_info.param_count,
+                                args.len()
                             ));
                         }
                         // Analyze arguments
@@ -518,10 +523,10 @@ impl SemanticAnalyzer {
                     TypeSpec::Int
                 }
             }
-            Expr::PostIncrement(operand) | Expr::PostDecrement(operand)
-            | Expr::PreIncrement(operand) | Expr::PreDecrement(operand) => {
-                self.analyze_expr(operand)
-            }
+            Expr::PostIncrement(operand)
+            | Expr::PostDecrement(operand)
+            | Expr::PreIncrement(operand)
+            | Expr::PreDecrement(operand) => self.analyze_expr(operand),
             Expr::Ternary {
                 condition,
                 then_expr,
@@ -572,7 +577,11 @@ impl SemanticAnalyzer {
     fn promote_types(&self, a: &TypeSpec, b: &TypeSpec) -> TypeSpec {
         let rank_a = Self::type_rank(a);
         let rank_b = Self::type_rank(b);
-        if rank_a >= rank_b { a.clone() } else { b.clone() }
+        if rank_a >= rank_b {
+            a.clone()
+        } else {
+            b.clone()
+        }
     }
 
     /// Integer conversion rank (higher = wider).
@@ -636,7 +645,9 @@ mod tests {
         );
         assert!(result.is_err(), "Expected error for wrong arg count");
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.message.contains("expects 2 arguments")));
+        assert!(errors
+            .iter()
+            .any(|e| e.message.contains("expects 2 arguments")));
     }
 
     #[test]
@@ -644,24 +655,32 @@ mod tests {
         let result = analyze_source(
             r#"int printf(const char *fmt, ...); int main() { printf("hello %d", 42); return 0; }"#,
         );
-        assert!(result.is_ok(), "Variadic function should accept extra args: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Variadic function should accept extra args: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_variable_shadowing() {
-        let result = analyze_source(
-            "int main() { int x = 1; { int x = 2; return x; } }",
-        );
+        let result = analyze_source("int main() { int x = 1; { int x = 2; return x; } }");
         // Shadowing is allowed in C (different scopes)
-        assert!(result.is_ok(), "Variable shadowing should be allowed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Variable shadowing should be allowed: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_struct_declaration() {
-        let result = analyze_source(
-            "struct Point { int x; int y; }; int main() { return 0; }",
+        let result = analyze_source("struct Point { int x; int y; }; int main() { return 0; }");
+        assert!(
+            result.is_ok(),
+            "Struct declaration should be valid: {:?}",
+            result
         );
-        assert!(result.is_ok(), "Struct declaration should be valid: {:?}", result);
     }
 
     #[test]
@@ -674,9 +693,7 @@ mod tests {
 
     #[test]
     fn test_typedef() {
-        let result = analyze_source(
-            "typedef int i32; int main() { return 0; }",
-        );
+        let result = analyze_source("typedef int i32; int main() { return 0; }");
         assert!(result.is_ok(), "Typedef should be valid: {:?}", result);
     }
 
@@ -685,31 +702,35 @@ mod tests {
         let result = analyze_source(
             "int main() { char c = 65; short s = 100; long l = 1000; unsigned int u = 42; return 0; }",
         );
-        assert!(result.is_ok(), "Multiple integer types should work: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Multiple integer types should work: {:?}",
+            result
+        );
     }
 
     #[test]
     fn test_sizeof() {
-        let result = analyze_source(
-            "int main() { return sizeof(int); }",
-        );
+        let result = analyze_source("int main() { return sizeof(int); }");
         assert!(result.is_ok(), "sizeof should work: {:?}", result);
     }
 
     #[test]
     fn test_struct_duplicate_field() {
-        let result = analyze_source(
-            "struct Bad { int x; int x; }; int main() { return 0; }",
+        let result = analyze_source("struct Bad { int x; int x; }; int main() { return 0; }");
+        assert!(
+            result.is_err(),
+            "Duplicate struct fields should be an error"
         );
-        assert!(result.is_err(), "Duplicate struct fields should be an error");
     }
 
     #[test]
     fn test_function_type_conflict() {
-        let result = analyze_source(
-            "int foo(); long foo(); int main() { return 0; }",
+        let result = analyze_source("int foo(); long foo(); int main() { return 0; }");
+        assert!(
+            result.is_err(),
+            "Conflicting return types should be an error"
         );
-        assert!(result.is_err(), "Conflicting return types should be an error");
     }
 
     #[test]
@@ -722,9 +743,8 @@ mod tests {
 
     #[test]
     fn test_nested_scopes() {
-        let result = analyze_source(
-            "int main() { int a = 1; { int b = 2; { int c = a + b; } } return a; }",
-        );
+        let result =
+            analyze_source("int main() { int a = 1; { int b = 2; { int c = a + b; } } return a; }");
         assert!(result.is_ok(), "Nested scopes should work: {:?}", result);
     }
 
@@ -746,21 +766,26 @@ mod tests {
 
     #[test]
     fn test_deref_non_pointer() {
-        let result = analyze_source(
-            "int main() { int x = 5; int y = *x; return y; }",
+        let result = analyze_source("int main() { int x = 5; int y = *x; return y; }");
+        assert!(
+            result.is_err(),
+            "Dereferencing non-pointer should be an error"
         );
-        assert!(result.is_err(), "Dereferencing non-pointer should be an error");
     }
 
     #[test]
     fn test_implicit_function_declaration_warning() {
-        let result = analyze_source(
-            "int main() { puts(\"hello\"); return 0; }",
-        );
+        let result = analyze_source("int main() { puts(\"hello\"); return 0; }");
         // This should succeed (implicit decl is a warning, not error) but with warnings
-        assert!(result.is_ok(), "Implicit function decl should be a warning: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Implicit function decl should be a warning: {:?}",
+            result
+        );
         let warnings = result.unwrap();
-        assert!(warnings.iter().any(|w| w.message.contains("Implicit declaration")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.message.contains("Implicit declaration")));
     }
 
     #[test]
@@ -768,6 +793,10 @@ mod tests {
         let result = analyze_source(
             "enum Flags { A = 1, B = 2, C = 4 }; int main() { int f = A; return f; }",
         );
-        assert!(result.is_ok(), "Enum with explicit values should work: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Enum with explicit values should work: {:?}",
+            result
+        );
     }
 }

@@ -48,10 +48,10 @@ pub enum TypeSpec {
     UnsignedLong,
     Pointer(Box<TypeSpec>),
     Array(Box<TypeSpec>, Option<usize>), // element type, optional size
-    Struct(String, Option<Vec<StructField>>),     // name, optional fields (definition)
-    Union(String, Option<Vec<StructField>>),      // name, optional fields (definition)
-    Enum(String, Option<Vec<EnumVariant>>),       // name, optional variants
-    TypedefName(String),                          // reference to a typedef
+    Struct(String, Option<Vec<StructField>>), // name, optional fields (definition)
+    Union(String, Option<Vec<StructField>>), // name, optional fields (definition)
+    Enum(String, Option<Vec<EnumVariant>>), // name, optional variants
+    TypedefName(String),                 // reference to a typedef
     FunctionPointer {
         return_type: Box<TypeSpec>,
         param_types: Vec<TypeSpec>,
@@ -384,7 +384,7 @@ impl Parser {
                         }
                         TypeSpec::UnsignedShort
                     }
-                    _ => TypeSpec::UnsignedInt // bare "unsigned" = unsigned int
+                    _ => TypeSpec::UnsignedInt, // bare "unsigned" = unsigned int
                 }
             }
             TokenKind::Signed => {
@@ -412,7 +412,7 @@ impl Parser {
                         }
                         TypeSpec::Short
                     }
-                    _ => TypeSpec::Int // bare "signed" = signed int
+                    _ => TypeSpec::Int, // bare "signed" = signed int
                 }
             }
             TokenKind::Struct => {
