@@ -257,9 +257,8 @@ fn test_do_while() {
 #[test]
 fn test_do_while_once() {
     // do-while always executes body at least once, even if condition is false
-    let (code, _) = compile_and_run(
-        "int main() { int x = 0; do { x = 42; } while (0); return x; }",
-    );
+    let (code, _) =
+        compile_and_run("int main() { int x = 0; do { x = 42; } while (0); return x; }");
     assert_eq!(code, 42);
 }
 
@@ -286,17 +285,13 @@ fn test_continue_in_for() {
 
 #[test]
 fn test_post_increment() {
-    let (code, _) = compile_and_run(
-        "int main() { int x = 41; x++; return x; }",
-    );
+    let (code, _) = compile_and_run("int main() { int x = 41; x++; return x; }");
     assert_eq!(code, 42);
 }
 
 #[test]
 fn test_post_decrement() {
-    let (code, _) = compile_and_run(
-        "int main() { int x = 43; x--; return x; }",
-    );
+    let (code, _) = compile_and_run("int main() { int x = 43; x--; return x; }");
     assert_eq!(code, 42);
 }
 
