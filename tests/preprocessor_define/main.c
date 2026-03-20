@@ -1,4 +1,4 @@
-#include <stdio.h>
+int printf(const char *fmt, ...);
 
 #define VALUE 42
 #define DOUBLE(x) ((x) * 2)
