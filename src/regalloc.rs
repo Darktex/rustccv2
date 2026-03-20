@@ -392,7 +392,7 @@ mod tests {
         let result = linear_scan(&module.functions[0], 4);
         assert_eq!(result.num_spill_slots, 0);
         // All vregs should be assigned to registers
-        for (_vreg, loc) in &result.assignments {
+        for loc in result.assignments.values() {
             assert!(matches!(loc, Location::Reg(_)));
         }
     }
