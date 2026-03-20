@@ -223,3 +223,277 @@ fn test_complex_expr() {
     // (2+3)*(2+3) - 2*3 = 25 - 6 = 19
     assert_eq!(code, 19);
 }
+
+// === Compound assignment operators ===
+
+#[test]
+fn test_plus_assign() {
+    let (code, _) = compile_and_run("int main() { int x = 10; x += 32; return x; }");
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_minus_assign() {
+    let (code, _) = compile_and_run("int main() { int x = 50; x -= 8; return x; }");
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_star_assign() {
+    let (code, _) = compile_and_run("int main() { int x = 6; x *= 7; return x; }");
+    assert_eq!(code, 42);
+}
+
+// === Do-while ===
+
+#[test]
+fn test_do_while() {
+    let (code, _) = compile_and_run(
+        "int main() { int i = 0; int sum = 0; do { sum = sum + i; i = i + 1; } while (i < 10); return sum; }",
+    );
+    assert_eq!(code, 45);
+}
+
+#[test]
+fn test_do_while_once() {
+    // do-while always executes body at least once, even if condition is false
+    let (code, _) = compile_and_run(
+        "int main() { int x = 0; do { x = 42; } while (0); return x; }",
+    );
+    assert_eq!(code, 42);
+}
+
+// === Break and continue ===
+
+#[test]
+fn test_break_in_while() {
+    let (code, _) = compile_and_run(
+        "int main() { int i = 0; while (1) { if (i == 5) { break; } i = i + 1; } return i; }",
+    );
+    assert_eq!(code, 5);
+}
+
+#[test]
+fn test_continue_in_for() {
+    let (code, _) = compile_and_run(
+        "int main() { int sum = 0; for (int i = 0; i < 10; i = i + 1) { if (i % 2 == 0) { continue; } sum = sum + i; } return sum; }",
+    );
+    // sum of odd numbers 1+3+5+7+9 = 25
+    assert_eq!(code, 25);
+}
+
+// === Post/pre increment/decrement ===
+
+#[test]
+fn test_post_increment() {
+    let (code, _) = compile_and_run(
+        "int main() { int x = 41; x++; return x; }",
+    );
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_post_decrement() {
+    let (code, _) = compile_and_run(
+        "int main() { int x = 43; x--; return x; }",
+    );
+    assert_eq!(code, 42);
+}
+
+// === Logical operators ===
+
+#[test]
+fn test_logical_and_true() {
+    let (code, _) = compile_and_run("int main() { return 1 && 1; }");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn test_logical_and_false() {
+    let (code, _) = compile_and_run("int main() { return 1 && 0; }");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn test_logical_or_true() {
+    let (code, _) = compile_and_run("int main() { return 0 || 1; }");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn test_logical_or_false() {
+    let (code, _) = compile_and_run("int main() { return 0 || 0; }");
+    assert_eq!(code, 0);
+}
+
+// === Comparison operators (le, ge) ===
+
+#[test]
+fn test_le() {
+    let (code, _) = compile_and_run("int main() { return (5 <= 5) + (3 <= 5); }");
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn test_ge() {
+    let (code, _) = compile_and_run("int main() { return (5 >= 5) + (5 >= 3); }");
+    assert_eq!(code, 2);
+}
+
+// === Multiple function calls ===
+
+#[test]
+fn test_recursive_function() {
+    let source = r#"
+        int factorial(int n) {
+            if (n <= 1) { return 1; }
+            return n * factorial(n - 1);
+        }
+        int main() {
+            return factorial(5);
+        }
+    "#;
+    let (code, _) = compile_and_run(source);
+    // 5! = 120
+    assert_eq!(code, 120);
+}
+
+#[test]
+fn test_multiple_functions() {
+    let source = r#"
+        int square(int x) { return x * x; }
+        int add(int a, int b) { return a + b; }
+        int main() {
+            return add(square(3), square(4));
+        }
+    "#;
+    let (code, _) = compile_and_run(source);
+    // 9 + 16 = 25
+    assert_eq!(code, 25);
+}
+
+// === Preprocessor integration ===
+
+#[test]
+fn test_preprocessor_define() {
+    let source = r#"
+        #define ANSWER 42
+        int main() { return ANSWER; }
+    "#;
+    let (code, _) = compile_and_run(source);
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_preprocessor_ifdef() {
+    let source = r#"
+        #define DEBUG
+        int main() {
+            #ifdef DEBUG
+            return 1;
+            #else
+            return 0;
+            #endif
+        }
+    "#;
+    let (code, _) = compile_and_run(source);
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn test_preprocessor_ifndef() {
+    let source = r#"
+        int main() {
+            #ifndef UNDEFINED_MACRO
+            return 42;
+            #else
+            return 0;
+            #endif
+        }
+    "#;
+    let (code, _) = compile_and_run(source);
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_preprocessor_function_macro() {
+    let source = r#"
+        #define MAX(a, b) ((a) > (b) ? (a) : (b))
+        int main() { return MAX(10, 42); }
+    "#;
+    let (code, _) = compile_and_run(source);
+    assert_eq!(code, 42);
+}
+
+// === Ternary operator ===
+
+#[test]
+fn test_ternary_true() {
+    let (code, _) = compile_and_run("int main() { return 1 ? 42 : 0; }");
+    assert_eq!(code, 42);
+}
+
+#[test]
+fn test_ternary_false() {
+    let (code, _) = compile_and_run("int main() { return 0 ? 0 : 42; }");
+    assert_eq!(code, 42);
+}
+
+// === Char literal ===
+
+#[test]
+fn test_char_literal() {
+    let (code, _) = compile_and_run("int main() { char c = 'A'; return c; }");
+    assert_eq!(code, 65);
+}
+
+// === Printf with integer ===
+
+#[test]
+fn test_printf_format() {
+    let source = r#"
+        int printf(const char *fmt, ...);
+        int main() {
+            printf("%d plus %d equals %d\n", 2, 3, 5);
+            return 0;
+        }
+    "#;
+    let (code, stdout) = compile_and_run(source);
+    assert_eq!(code, 0);
+    assert_eq!(stdout.trim(), "2 plus 3 equals 5");
+}
+
+// === Nested loops ===
+
+#[test]
+fn test_nested_for_loops() {
+    let source = r#"
+        int main() {
+            int sum = 0;
+            for (int i = 0; i < 3; i = i + 1) {
+                for (int j = 0; j < 3; j = j + 1) {
+                    sum = sum + 1;
+                }
+            }
+            return sum;
+        }
+    "#;
+    let (code, _) = compile_and_run(source);
+    assert_eq!(code, 9);
+}
+
+// === Enum usage ===
+
+#[test]
+fn test_enum_values() {
+    let source = r#"
+        enum Color { RED, GREEN, BLUE };
+        int main() {
+            int c = 2;
+            return c;
+        }
+    "#;
+    let (code, _) = compile_and_run(source);
+    // BLUE = 2
+    assert_eq!(code, 2);
+}
