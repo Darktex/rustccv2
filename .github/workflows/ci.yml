@@ -108,10 +108,8 @@ jobs:
             fi
 
             # Run both and capture output + exit code
-            gcc_out=$("/tmp/gcc_${test_name}" 2>&1) || true
-            gcc_rc=$?
-            rustcc_out=$("/tmp/rustcc_${test_name}" 2>&1) || true
-            rustcc_rc=$?
+            gcc_out=$("/tmp/gcc_${test_name}" 2>&1) && gcc_rc=$? || gcc_rc=$?
+            rustcc_out=$("/tmp/rustcc_${test_name}" 2>&1) && rustcc_rc=$? || rustcc_rc=$?
 
             # Compare expected return code if specified
             if [ -f "$test_dir/expected.ret" ]; then
