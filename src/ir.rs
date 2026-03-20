@@ -191,6 +191,14 @@ impl FunctionBuilder {
     }
 
     fn start_block(&mut self, label: Label) {
+        // If the current label differs from the last terminated block's label,
+        // it means we have an un-terminated block (e.g., an empty merge point
+        // from an inner if/else where all paths returned).  Push it with a
+        // fallthrough jump so its label exists in the assembly output.
+        let last_terminated = self.blocks.last().map(|b| b.label);
+        if last_terminated != Some(self.current_label) {
+            self.terminate(Terminator::Jump(label));
+        }
         self.current_label = label;
         self.current_block = Vec::new();
     }
