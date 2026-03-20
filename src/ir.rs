@@ -272,11 +272,6 @@ impl IrBuilder {
         let body = func.body.as_ref().unwrap();
         self.lower_block(&mut fb, body);
 
-        // Ensure function has a return
-        if fb.blocks.is_empty() || !fb.current_block.is_empty() {
-            fb.terminate(Terminator::Return(Some(Operand::Immediate(0))));
-        }
-
         self.functions.push(fb.finish());
     }
 
@@ -344,16 +339,8 @@ impl IrBuilder {
                 // Then block
                 fb.start_block(then_label);
                 self.lower_stmt(fb, then_branch);
-                if !fb.current_block.is_empty()
-                    || fb.blocks.last().is_none_or(|b| {
-                        matches!(b.terminator, Terminator::None)
-                            || (b.label != then_label
-                                && !matches!(
-                                    b.terminator,
-                                    Terminator::Return(_) | Terminator::Jump(_)
-                                ))
-                    })
-                {
+                // Only emit jump if the then block didn't already terminate
+                if !fb.current_block.is_empty() {
                     fb.terminate(Terminator::Jump(end_label));
                 }
 
@@ -361,7 +348,11 @@ impl IrBuilder {
                 if let Some(else_br) = else_branch {
                     fb.start_block(else_label);
                     self.lower_stmt(fb, else_br);
-                    fb.terminate(Terminator::Jump(end_label));
+                    // Only emit jump if the else block didn't already terminate
+                    // (e.g., with a return statement)
+                    if !fb.current_block.is_empty() {
+                        fb.terminate(Terminator::Jump(end_label));
+                    }
                 }
 
                 fb.start_block(end_label);
