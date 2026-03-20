@@ -5,7 +5,7 @@
 //! are exhausted, the interval with the furthest end point is spilled
 //! to a stack slot.
 
-use crate::ir::{Function, Instruction, Module, Operand, Terminator, VReg};
+use crate::ir::{Function, Instruction, Label, Module, Operand, Terminator, VReg};
 use std::collections::{BTreeSet, HashMap};
 
 /// A live interval: vreg is live from `start` to `end` (inclusive).
@@ -140,8 +140,56 @@ fn terminator_uses(term: &Terminator) -> Vec<VReg> {
     }
 }
 
+/// Collect the successor block labels from a terminator.
+fn terminator_targets(term: &Terminator) -> Vec<Label> {
+    match term {
+        Terminator::Jump(label) => vec![*label],
+        Terminator::Branch {
+            true_label,
+            false_label,
+            ..
+        } => vec![*true_label, *false_label],
+        Terminator::Return(_) | Terminator::None => vec![],
+    }
+}
+
+/// Build a map from block label to block index.
+fn label_to_index(func: &Function) -> HashMap<Label, usize> {
+    func.blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label, i))
+        .collect()
+}
+
+/// Detect loop ranges by finding back-edges in the CFG.
+/// Returns a list of (loop_start_pos, loop_end_pos) for each loop detected.
+/// A back-edge is a CFG edge where the target block index <= source block index.
+fn detect_loop_ranges(func: &Function, block_starts: &[u32]) -> Vec<(u32, u32)> {
+    let label_map = label_to_index(func);
+    let mut loop_ranges = Vec::new();
+
+    for (src_idx, block) in func.blocks.iter().enumerate() {
+        for target_label in terminator_targets(&block.terminator) {
+            if let Some(&tgt_idx) = label_map.get(&target_label) {
+                if tgt_idx <= src_idx {
+                    // Back-edge: src_idx -> tgt_idx where tgt is earlier
+                    let loop_start = block_starts[tgt_idx];
+                    // End of the source block (terminator position + 1)
+                    let loop_end =
+                        block_starts[src_idx] + (block.instructions.len() as u32) * 2 + 1;
+                    loop_ranges.push((loop_start, loop_end));
+                }
+            }
+        }
+    }
+
+    loop_ranges
+}
+
 /// Compute live intervals for all vregs in a function.
-/// Uses a simple forward scan: for each vreg, record first def and last use.
+/// Handles loop back-edges by extending live intervals for vregs that are
+/// live across loop boundaries.
 pub fn compute_live_intervals(func: &Function) -> Vec<LiveInterval> {
     let mut first_def: HashMap<VReg, u32> = HashMap::new();
     let mut last_use: HashMap<VReg, u32> = HashMap::new();
@@ -184,6 +232,25 @@ pub fn compute_live_intervals(func: &Function) -> Vec<LiveInterval> {
                 .and_modify(|e| *e = (*e).max(term_pos))
                 .or_insert(term_pos);
             first_def.entry(vreg).or_insert(0);
+        }
+    }
+
+    // Extend live intervals across loop back-edges.
+    // For each loop (detected by back-edges), any vreg whose interval overlaps
+    // the loop range must be extended to cover the entire loop.
+    let loop_ranges = detect_loop_ranges(func, &block_starts);
+    for (loop_start, loop_end) in &loop_ranges {
+        for (&vreg, def) in &first_def {
+            let use_end = last_use.get(&vreg).copied().unwrap_or(*def);
+            // If the vreg's interval overlaps with the loop range, extend it
+            // to cover the entire loop. A vreg overlaps the loop if it is
+            // defined before the loop ends and used after the loop starts.
+            if *def <= *loop_end && use_end >= *loop_start {
+                last_use
+                    .entry(vreg)
+                    .and_modify(|e| *e = (*e).max(*loop_end))
+                    .or_insert(*loop_end);
+            }
         }
     }
 
