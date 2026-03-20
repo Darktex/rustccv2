@@ -3,6 +3,7 @@ mod ir;
 mod lexer;
 mod parser;
 mod preprocessor;
+mod regalloc;
 mod sema;
 
 use std::env;
