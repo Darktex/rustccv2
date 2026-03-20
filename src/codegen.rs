@@ -713,3 +713,68 @@ mod tests {
         assert!(asm.contains(".L"));
     }
 }
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    use crate::ir;
+    use crate::lexer;
+    use crate::parser;
+
+    fn verify_labels(asm: &str) {
+        let mut defined = std::collections::HashSet::new();
+        let mut referenced = std::collections::HashSet::new();
+        for line in asm.lines() {
+            let trimmed = line.trim();
+            if trimmed.ends_with(':') && !trimmed.starts_with('.')
+                || (trimmed.starts_with('.') && trimmed.ends_with(':'))
+            {
+                let label = trimmed.trim_end_matches(':').to_string();
+                defined.insert(label);
+            }
+            for prefix in &["jmp ", "jne ", "je ", "jg ", "jl ", "jge ", "jle "] {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    let label = rest.trim().to_string();
+                    referenced.insert(label);
+                }
+            }
+        }
+        let missing: Vec<_> = referenced.difference(&defined).collect();
+        assert!(
+            missing.is_empty(),
+            "Missing labels in assembly:\n{}\nMissing: {:?}",
+            asm,
+            missing
+        );
+    }
+
+    #[test]
+    fn test_nested_if_labels() {
+        let source = "int main() { int x = 15; if (x > 10) { if (x > 20) { return 3; } else { return 2; } } else { return 1; } }";
+        let tokens = lexer::lex(source).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let module = ir::lower(&program);
+        let asm = generate(&module);
+        verify_labels(&asm);
+    }
+
+    #[test]
+    fn test_while_loop_labels() {
+        let source = "int main() { int x = 10; while (x > 0) { x = x - 1; } return x; }";
+        let tokens = lexer::lex(source).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let module = ir::lower(&program);
+        let asm = generate(&module);
+        verify_labels(&asm);
+    }
+
+    #[test]
+    fn test_for_loop_labels() {
+        let source = "int main() { int s = 0; for (int i = 0; i < 10; i++) { s += i; } return s; }";
+        let tokens = lexer::lex(source).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let module = ir::lower(&program);
+        let asm = generate(&module);
+        verify_labels(&asm);
+    }
+}
