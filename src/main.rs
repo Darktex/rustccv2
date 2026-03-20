@@ -2,13 +2,15 @@ mod codegen;
 mod ir;
 mod lexer;
 mod parser;
+mod preprocessor;
 
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 use std::process::{self, Command};
 
 fn print_usage() {
-    eprintln!("Usage: rustcc [-o output] <input.c>");
+    eprintln!("Usage: rustcc [-o output] [-I path] <input.c>");
     process::exit(1);
 }
 
@@ -21,6 +23,7 @@ fn main() {
 
     let mut input_file = None;
     let mut output_file = String::from("a.out");
+    let mut include_paths: Vec<PathBuf> = Vec::new();
     let mut i = 1;
 
     while i < args.len() {
@@ -32,6 +35,18 @@ fn main() {
                     process::exit(1);
                 }
                 output_file = args[i].clone();
+            }
+            "-I" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: -I requires an argument");
+                    process::exit(1);
+                }
+                include_paths.push(PathBuf::from(&args[i]));
+            }
+            arg if arg.starts_with("-I") => {
+                // Support -Ipath (no space)
+                include_paths.push(PathBuf::from(&arg[2..]));
             }
             arg if arg.starts_with('-') => {
                 eprintln!("Error: unknown option '{}'", arg);
@@ -56,6 +71,15 @@ fn main() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error: cannot read '{}': {}", input_file, e);
+            process::exit(1);
+        }
+    };
+
+    // Preprocess
+    let source = match preprocessor::preprocess(&source, &input_file, include_paths) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Preprocessor error: {}", e);
             process::exit(1);
         }
     };
