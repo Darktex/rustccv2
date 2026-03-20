@@ -12,6 +12,8 @@ pub struct Program {
 pub enum Declaration {
     Function(FunctionDef),
     GlobalVar(VarDecl),
+    Typedef(TypeSpec, String), // aliased type, alias name
+    StructDecl(TypeSpec),      // struct/union/enum definition (standalone)
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +22,7 @@ pub struct FunctionDef {
     pub return_type: TypeSpec,
     pub name: String,
     pub params: Vec<Param>,
+    pub is_variadic: bool,
     pub body: Option<Block>,
 }
 
@@ -30,16 +33,41 @@ pub struct Param {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum TypeSpec {
-    Int,
-    Char,
     Void,
-    Long,
+    Char,
+    SignedChar,
+    UnsignedChar,
     Short,
-    Unsigned,
+    UnsignedShort,
+    Int,
+    UnsignedInt,
+    Long,
+    UnsignedLong,
     Pointer(Box<TypeSpec>),
+    Array(Box<TypeSpec>, Option<usize>), // element type, optional size
+    Struct(String, Option<Vec<StructField>>),     // name, optional fields (definition)
+    Union(String, Option<Vec<StructField>>),      // name, optional fields (definition)
+    Enum(String, Option<Vec<EnumVariant>>),       // name, optional variants
+    TypedefName(String),                          // reference to a typedef
+    FunctionPointer {
+        return_type: Box<TypeSpec>,
+        param_types: Vec<TypeSpec>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructField {
+    pub type_spec: TypeSpec,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,19 +249,40 @@ impl Parser {
     }
 
     fn parse_declaration(&mut self) -> Result<Declaration, String> {
+        // Check for typedef
+        if matches!(self.peek(), TokenKind::Typedef) {
+            self.advance();
+            let type_spec = self.parse_type_spec()?;
+            let alias = self.parse_identifier()?;
+            self.expect(&TokenKind::Semicolon)?;
+            return Ok(Declaration::Typedef(type_spec, alias));
+        }
+
         // Check for extern
         let is_extern = matches!(self.peek(), TokenKind::Extern);
         if is_extern {
             self.advance();
         }
 
+        // Check for static
+        if matches!(self.peek(), TokenKind::Static) {
+            self.advance();
+        }
+
         let type_spec = self.parse_type_spec()?;
+
+        // Check for standalone struct/union/enum declaration (no name follows)
+        if matches!(self.peek(), TokenKind::Semicolon) {
+            self.advance();
+            return Ok(Declaration::StructDecl(type_spec));
+        }
+
         let name = self.parse_identifier()?;
 
         if matches!(self.peek(), TokenKind::LeftParen) {
             // Function
             self.advance(); // (
-            let params = self.parse_param_list()?;
+            let (params, is_variadic) = self.parse_param_list()?;
             self.expect(&TokenKind::RightParen)?;
 
             if matches!(self.peek(), TokenKind::Semicolon) {
@@ -243,6 +292,7 @@ impl Parser {
                     return_type: type_spec,
                     name,
                     params,
+                    is_variadic,
                     body: None,
                 }))
             } else {
@@ -251,6 +301,7 @@ impl Parser {
                     return_type: type_spec,
                     name,
                     params,
+                    is_variadic,
                     body: Some(body),
                 }))
             }
@@ -287,8 +338,13 @@ impl Parser {
             }
             TokenKind::Long => {
                 self.advance();
-                // Accept "long" or "long int"
-                if matches!(self.peek(), TokenKind::Int) {
+                // Accept "long" or "long int" or "long long"
+                if matches!(self.peek(), TokenKind::Long) {
+                    self.advance(); // long long
+                    if matches!(self.peek(), TokenKind::Int) {
+                        self.advance();
+                    }
+                } else if matches!(self.peek(), TokenKind::Int) {
                     self.advance();
                 }
                 TypeSpec::Long
@@ -302,39 +358,74 @@ impl Parser {
             }
             TokenKind::Unsigned => {
                 self.advance();
-                // Accept "unsigned", "unsigned int", "unsigned long", etc.
                 match self.peek() {
                     TokenKind::Int => {
                         self.advance();
+                        TypeSpec::UnsignedInt
                     }
                     TokenKind::Long => {
+                        self.advance();
+                        if matches!(self.peek(), TokenKind::Long) {
+                            self.advance(); // unsigned long long
+                        }
+                        if matches!(self.peek(), TokenKind::Int) {
+                            self.advance();
+                        }
+                        TypeSpec::UnsignedLong
+                    }
+                    TokenKind::Char => {
+                        self.advance();
+                        TypeSpec::UnsignedChar
+                    }
+                    TokenKind::Short => {
                         self.advance();
                         if matches!(self.peek(), TokenKind::Int) {
                             self.advance();
                         }
+                        TypeSpec::UnsignedShort
                     }
-                    TokenKind::Char => {
-                        self.advance();
-                    }
-                    _ => {}
+                    _ => TypeSpec::UnsignedInt // bare "unsigned" = unsigned int
                 }
-                TypeSpec::Unsigned
             }
             TokenKind::Signed => {
                 self.advance();
                 match self.peek() {
                     TokenKind::Int => {
                         self.advance();
+                        TypeSpec::Int
                     }
                     TokenKind::Long => {
                         self.advance();
+                        if matches!(self.peek(), TokenKind::Int) {
+                            self.advance();
+                        }
+                        TypeSpec::Long
                     }
                     TokenKind::Char => {
                         self.advance();
+                        TypeSpec::SignedChar
                     }
-                    _ => {}
+                    TokenKind::Short => {
+                        self.advance();
+                        if matches!(self.peek(), TokenKind::Int) {
+                            self.advance();
+                        }
+                        TypeSpec::Short
+                    }
+                    _ => TypeSpec::Int // bare "signed" = signed int
                 }
-                TypeSpec::Int
+            }
+            TokenKind::Struct => {
+                self.advance();
+                self.parse_struct_or_union(true)?
+            }
+            TokenKind::Union => {
+                self.advance();
+                self.parse_struct_or_union(false)?
+            }
+            TokenKind::Enum => {
+                self.advance();
+                self.parse_enum_spec()?
             }
             TokenKind::Const => {
                 self.advance();
@@ -352,14 +443,112 @@ impl Parser {
             }
         };
 
-        // Handle pointer types
+        // Handle pointer types (possibly with const qualifier)
         let mut result = base;
         while matches!(self.peek(), TokenKind::Star) {
             self.advance();
+            // Skip const after * (e.g., int *const p)
+            if matches!(self.peek(), TokenKind::Const) {
+                self.advance();
+            }
             result = TypeSpec::Pointer(Box::new(result));
         }
 
         Ok(result)
+    }
+
+    fn parse_struct_or_union(&mut self, is_struct: bool) -> Result<TypeSpec, String> {
+        // Parse optional name
+        let name = if matches!(self.peek(), TokenKind::Identifier(_)) {
+            self.parse_identifier()?
+        } else {
+            format!("__anon_{}", self.pos) // anonymous struct/union
+        };
+
+        // Parse optional body
+        let fields = if matches!(self.peek(), TokenKind::LeftBrace) {
+            self.advance();
+            let mut fields = Vec::new();
+            while !matches!(self.peek(), TokenKind::RightBrace | TokenKind::Eof) {
+                let field_type = self.parse_type_spec()?;
+                let field_name = self.parse_identifier()?;
+                // Handle array fields
+                if matches!(self.peek(), TokenKind::LeftBracket) {
+                    self.advance();
+                    if !matches!(self.peek(), TokenKind::RightBracket) {
+                        let _ = self.parse_expr()?; // skip size for now
+                    }
+                    self.expect(&TokenKind::RightBracket)?;
+                }
+                self.expect(&TokenKind::Semicolon)?;
+                fields.push(StructField {
+                    type_spec: field_type,
+                    name: field_name,
+                });
+            }
+            self.expect(&TokenKind::RightBrace)?;
+            Some(fields)
+        } else {
+            None
+        };
+
+        if is_struct {
+            Ok(TypeSpec::Struct(name, fields))
+        } else {
+            Ok(TypeSpec::Union(name, fields))
+        }
+    }
+
+    fn parse_enum_spec(&mut self) -> Result<TypeSpec, String> {
+        let name = if matches!(self.peek(), TokenKind::Identifier(_)) {
+            self.parse_identifier()?
+        } else {
+            format!("__anon_enum_{}", self.pos)
+        };
+
+        let variants = if matches!(self.peek(), TokenKind::LeftBrace) {
+            self.advance();
+            let mut variants = Vec::new();
+            let mut next_value: i64 = 0;
+            while !matches!(self.peek(), TokenKind::RightBrace | TokenKind::Eof) {
+                let variant_name = self.parse_identifier()?;
+                let value = if matches!(self.peek(), TokenKind::Assign) {
+                    self.advance();
+                    match self.peek() {
+                        TokenKind::IntLiteral(v) => {
+                            let v = *v;
+                            self.advance();
+                            next_value = v + 1;
+                            Some(v)
+                        }
+                        _ => {
+                            let (line, col) = self.line_col();
+                            return Err(format!(
+                                "Expected integer literal for enum value at line {}, col {}",
+                                line, col
+                            ));
+                        }
+                    }
+                } else {
+                    let v = next_value;
+                    next_value += 1;
+                    Some(v)
+                };
+                variants.push(EnumVariant {
+                    name: variant_name,
+                    value,
+                });
+                if matches!(self.peek(), TokenKind::Comma) {
+                    self.advance();
+                }
+            }
+            self.expect(&TokenKind::RightBrace)?;
+            Some(variants)
+        } else {
+            None
+        };
+
+        Ok(TypeSpec::Enum(name, variants))
     }
 
     fn parse_identifier(&mut self) -> Result<String, String> {
@@ -381,17 +570,18 @@ impl Parser {
         }
     }
 
-    fn parse_param_list(&mut self) -> Result<Vec<Param>, String> {
+    fn parse_param_list(&mut self) -> Result<(Vec<Param>, bool), String> {
         let mut params = Vec::new();
+        let mut is_variadic = false;
         if matches!(self.peek(), TokenKind::RightParen) {
-            return Ok(params);
+            return Ok((params, false));
         }
         if matches!(self.peek(), TokenKind::Void) {
             // Check if it's just "void" with no param name
             let save = self.pos;
             self.advance();
             if matches!(self.peek(), TokenKind::RightParen) {
-                return Ok(params);
+                return Ok((params, false));
             }
             self.pos = save;
         }
@@ -400,6 +590,7 @@ impl Parser {
             // Handle ellipsis for varargs
             if matches!(self.peek(), TokenKind::Ellipsis) {
                 self.advance();
+                is_variadic = true;
                 break;
             }
 
@@ -420,7 +611,7 @@ impl Parser {
             }
             self.advance(); // skip comma
         }
-        Ok(params)
+        Ok((params, is_variadic))
     }
 
     fn parse_block(&mut self) -> Result<Block, String> {
@@ -477,7 +668,10 @@ impl Parser {
             | TokenKind::Unsigned
             | TokenKind::Signed
             | TokenKind::Const
-            | TokenKind::Static => self.parse_var_decl_stmt(),
+            | TokenKind::Static
+            | TokenKind::Struct
+            | TokenKind::Union
+            | TokenKind::Enum => self.parse_var_decl_stmt(),
             _ => {
                 let expr = self.parse_expr()?;
                 self.expect(&TokenKind::Semicolon)?;
@@ -573,6 +767,10 @@ impl Parser {
                 | TokenKind::Long
                 | TokenKind::Short
                 | TokenKind::Unsigned
+                | TokenKind::Signed
+                | TokenKind::Struct
+                | TokenKind::Union
+                | TokenKind::Enum
         ) {
             Some(Box::new(self.parse_var_decl_stmt()?))
         } else {
@@ -1036,6 +1234,9 @@ impl Parser {
                 | TokenKind::Unsigned
                 | TokenKind::Signed
                 | TokenKind::Const
+                | TokenKind::Struct
+                | TokenKind::Union
+                | TokenKind::Enum
         )
     }
 
