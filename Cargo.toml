@@ -1,0 +1,13 @@
+[package]
+name = "rustcc"
+version = "0.1.0"
+edition = "2021"
+description = "A C compiler written in Rust"
+
+[lib]
+name = "rustcc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustcc"
+path = "src/main.rs"
