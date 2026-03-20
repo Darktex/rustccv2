@@ -407,6 +407,24 @@ impl SemanticAnalyzer {
                 self.pop_scope();
             }
             Stmt::Break | Stmt::Continue | Stmt::Empty => {}
+            Stmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                self.analyze_expr(expr);
+                for case in cases {
+                    self.analyze_expr(&case.value);
+                    for stmt in &case.body {
+                        self.analyze_stmt(stmt, return_type);
+                    }
+                }
+                if let Some(default_stmts) = default {
+                    for stmt in default_stmts {
+                        self.analyze_stmt(stmt, return_type);
+                    }
+                }
+            }
         }
     }
 
