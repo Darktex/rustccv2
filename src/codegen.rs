@@ -371,7 +371,7 @@ impl Aarch64CodeGen {
             }
             Operand::VReg(vreg) => {
                 let offset = self.slot_for(*vreg);
-                self.emit_line(&format!("ldr x0, [sp, #{}]", offset));
+                self.emit_line(&format!("ldr x0, [x29, #{}]", offset));
             }
         }
     }
@@ -384,7 +384,7 @@ impl Aarch64CodeGen {
             }
             Operand::VReg(vreg) => {
                 let offset = self.slot_for(*vreg);
-                self.emit_line(&format!("ldr x1, [sp, #{}]", offset));
+                self.emit_line(&format!("ldr x1, [x29, #{}]", offset));
             }
         }
     }
@@ -421,10 +421,10 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Store x0 to a vreg's stack slot
+    /// Store x0 to a vreg's stack slot (use x29/fp for stability across calls)
     fn store_x0(&mut self, vreg: VReg) {
         let offset = self.slot_for(vreg);
-        self.emit_line(&format!("str x0, [sp, #{}]", offset));
+        self.emit_line(&format!("str x0, [x29, #{}]", offset));
     }
 
     fn generate_module(&mut self, module: &Module) {
@@ -471,7 +471,7 @@ impl Aarch64CodeGen {
             if i < AARCH64_ARG_REGS.len() && !param_name.is_empty() {
                 if let Some(&vreg) = func.locals.get(param_name) {
                     let offset = self.slot_for(vreg);
-                    self.emit_line(&format!("str {}, [sp, #{}]", AARCH64_ARG_REGS[i], offset));
+                    self.emit_line(&format!("str {}, [x29, #{}]", AARCH64_ARG_REGS[i], offset));
                 }
             }
         }
@@ -561,30 +561,38 @@ impl Aarch64CodeGen {
             }
             Instruction::Call { dest, func, args } => {
                 // Load arguments into registers (AAPCS64)
-                // We need to be careful about clobbering, so save args to stack first
-                // then load into arg registers
+                // Evaluate each arg and save to a scratch area below sp,
+                // then load into arg registers. We use x29-relative addressing
+                // for operand loads so sp modifications are safe.
                 let num_args = args.len().min(AARCH64_ARG_REGS.len());
 
-                // For simplicity with <= 8 args, evaluate each into a temp vreg-like
-                // location, then load into arg regs
-                let mut saved_offsets = Vec::new();
-                for arg in args.iter() {
+                // Allocate scratch space for args (16-byte aligned)
+                let scratch_size = ((args.len() * 8 + 15) & !15) as i32;
+                if scratch_size > 0 {
+                    self.emit_line(&format!("sub sp, sp, #{}", scratch_size));
+                }
+
+                // Evaluate each arg and store to scratch area on stack
+                for (idx, arg) in args.iter().enumerate() {
                     self.load_operand_x0(arg);
-                    // Save to a temporary location by pushing (AArch64 style)
-                    self.emit_line("str x0, [sp, #-16]!");
-                    saved_offsets.push(());
+                    self.emit_line(&format!("str x0, [sp, #{}]", idx * 8));
                 }
 
-                // Pop back into argument registers in reverse
-                for i in (0..args.len()).rev() {
-                    if i < AARCH64_ARG_REGS.len() {
-                        self.emit_line(&format!("ldr {}, [sp], #16", AARCH64_ARG_REGS[i]));
-                    } else {
-                        self.emit_line("ldr x9, [sp], #16"); // discard
-                    }
+                // Load from scratch area into arg registers
+                for (i, reg) in AARCH64_ARG_REGS
+                    .iter()
+                    .enumerate()
+                    .take(args.len().min(AARCH64_ARG_REGS.len()))
+                {
+                    self.emit_line(&format!("ldr {}, [sp, #{}]", reg, i * 8));
                 }
 
-                let _ = (num_args, saved_offsets);
+                // Deallocate scratch space
+                if scratch_size > 0 {
+                    self.emit_line(&format!("add sp, sp, #{}", scratch_size));
+                }
+
+                let _ = num_args;
 
                 self.emit_line(&format!("bl {}", func));
 
@@ -598,19 +606,21 @@ impl Aarch64CodeGen {
                 self.store_x0(*dest);
             }
             Instruction::Alloca { dest, size } => {
-                self.emit_line(&format!("sub sp, sp, #{}", size));
+                // Align size to 16 bytes for AArch64 sp alignment
+                let aligned_size = (size + 15) & !15;
+                self.emit_line(&format!("sub sp, sp, #{}", aligned_size));
                 self.emit_line("mov x0, sp");
                 self.store_x0(*dest);
             }
             Instruction::Store { addr, value } => {
                 self.load_operand_x0(value);
                 let addr_offset = self.slot_for(*addr);
-                self.emit_line(&format!("ldr x1, [sp, #{}]", addr_offset));
+                self.emit_line(&format!("ldr x1, [x29, #{}]", addr_offset));
                 self.emit_line("str x0, [x1]");
             }
             Instruction::Load { dest, addr } => {
                 let addr_offset = self.slot_for(*addr);
-                self.emit_line(&format!("ldr x0, [sp, #{}]", addr_offset));
+                self.emit_line(&format!("ldr x0, [x29, #{}]", addr_offset));
                 self.emit_line("ldr x0, [x0]");
                 self.store_x0(*dest);
             }
