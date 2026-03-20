@@ -102,7 +102,19 @@ pub enum Stmt {
     Block(Block),
     Break,
     Continue,
+    Switch {
+        expr: Expr,
+        cases: Vec<SwitchCase>,
+        default: Option<Vec<Stmt>>,
+    },
     Empty,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SwitchCase {
+    pub value: Expr,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone)]
@@ -641,6 +653,7 @@ impl Parser {
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Do => self.parse_do_while(),
+            TokenKind::Switch => self.parse_switch(),
             TokenKind::LeftBrace => {
                 let block = self.parse_block()?;
                 Ok(Stmt::Block(block))
@@ -813,6 +826,67 @@ impl Parser {
         self.expect(&TokenKind::RightParen)?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(Stmt::DoWhile { body, condition })
+    }
+
+    fn parse_switch(&mut self) -> Result<Stmt, String> {
+        self.advance(); // switch
+        self.expect(&TokenKind::LeftParen)?;
+        let expr = self.parse_expr()?;
+        self.expect(&TokenKind::RightParen)?;
+        self.expect(&TokenKind::LeftBrace)?;
+
+        let mut cases = Vec::new();
+        let mut default = None;
+
+        while !matches!(self.peek(), TokenKind::RightBrace | TokenKind::Eof) {
+            match self.peek() {
+                TokenKind::Case => {
+                    self.advance(); // case
+                    let value = self.parse_expr()?;
+                    self.expect(&TokenKind::Colon)?;
+                    let mut body = Vec::new();
+                    while !matches!(
+                        self.peek(),
+                        TokenKind::Case
+                            | TokenKind::Default
+                            | TokenKind::RightBrace
+                            | TokenKind::Eof
+                    ) {
+                        body.push(self.parse_stmt()?);
+                    }
+                    cases.push(SwitchCase { value, body });
+                }
+                TokenKind::Default => {
+                    self.advance(); // default
+                    self.expect(&TokenKind::Colon)?;
+                    let mut body = Vec::new();
+                    while !matches!(
+                        self.peek(),
+                        TokenKind::Case
+                            | TokenKind::Default
+                            | TokenKind::RightBrace
+                            | TokenKind::Eof
+                    ) {
+                        body.push(self.parse_stmt()?);
+                    }
+                    default = Some(body);
+                }
+                _ => {
+                    let (line, col) = self.line_col();
+                    return Err(format!(
+                        "Expected 'case' or 'default' in switch at line {}, col {}",
+                        line, col
+                    ));
+                }
+            }
+        }
+
+        self.expect(&TokenKind::RightBrace)?;
+        Ok(Stmt::Switch {
+            expr,
+            cases,
+            default,
+        })
     }
 
     // Expression parsing with precedence climbing

@@ -487,6 +487,79 @@ impl IrBuilder {
                     fb.start_block(new_label);
                 }
             }
+            Stmt::Switch {
+                expr,
+                cases,
+                default,
+            } => {
+                let switch_val = self.lower_expr(fb, expr);
+                let end_label = fb.new_label();
+
+                // Save and set break label
+                let saved_break = fb.break_label;
+                fb.break_label = Some(end_label);
+
+                // Create labels for each case body and the default
+                let mut case_body_labels: Vec<Label> = Vec::new();
+                for _ in cases {
+                    case_body_labels.push(fb.new_label());
+                }
+                let default_label = fb.new_label();
+
+                // Emit comparison chain
+                for (i, case) in cases.iter().enumerate() {
+                    let case_val = self.lower_expr(fb, &case.value);
+                    let cmp_dest = fb.new_vreg();
+                    fb.emit(Instruction::Cmp {
+                        dest: cmp_dest,
+                        op: CmpOp::Eq,
+                        left: switch_val.clone(),
+                        right: case_val,
+                    });
+                    let next_cmp_label = fb.new_label();
+                    fb.terminate(Terminator::Branch {
+                        condition: Operand::VReg(cmp_dest),
+                        true_label: case_body_labels[i],
+                        false_label: next_cmp_label,
+                    });
+                    fb.start_block(next_cmp_label);
+                }
+
+                // If no case matched, jump to default or end
+                if default.is_some() {
+                    fb.terminate(Terminator::Jump(default_label));
+                } else {
+                    fb.terminate(Terminator::Jump(end_label));
+                }
+
+                // Emit case bodies (with fall-through between cases)
+                for (i, case) in cases.iter().enumerate() {
+                    fb.start_block(case_body_labels[i]);
+                    for stmt in &case.body {
+                        self.lower_stmt(fb, stmt);
+                    }
+                    // Fall through to next case body (or default, or end)
+                    if i + 1 < cases.len() {
+                        fb.terminate(Terminator::Jump(case_body_labels[i + 1]));
+                    } else if default.is_some() {
+                        fb.terminate(Terminator::Jump(default_label));
+                    } else {
+                        fb.terminate(Terminator::Jump(end_label));
+                    }
+                }
+
+                // Emit default body
+                if let Some(default_stmts) = default {
+                    fb.start_block(default_label);
+                    for stmt in default_stmts {
+                        self.lower_stmt(fb, stmt);
+                    }
+                    fb.terminate(Terminator::Jump(end_label));
+                }
+
+                fb.start_block(end_label);
+                fb.break_label = saved_break;
+            }
             Stmt::Empty => {}
         }
     }
