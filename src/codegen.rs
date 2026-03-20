@@ -1,19 +1,29 @@
 /// Code generator with x86-64 and AArch64 backends.
-/// Naive: every virtual register gets a stack slot.
+/// Supports both naive (every vreg on stack) and register-allocated modes.
 use crate::ir::{
     BasicBlock, CmpOp, Function, Instruction, IrBinOp, IrUnaryOp, Module, Operand, Terminator, VReg,
 };
+use crate::regalloc::{self, Location, RegAllocResult};
 use std::collections::HashMap;
 use std::fmt::Write;
 
 /// Dispatch to the appropriate backend based on target architecture.
 pub fn generate(module: &Module) -> String {
+    // Run register allocation
+    let regalloc_results = if cfg!(target_arch = "aarch64") {
+        regalloc::allocate_registers(module, AARCH64_ALLOC_REGS.len())
+    } else {
+        regalloc::allocate_registers(module, X86_ALLOC_REGS.len())
+    };
+
     if cfg!(target_arch = "aarch64") {
         let mut codegen = Aarch64CodeGen::new();
+        codegen.regalloc = regalloc_results;
         codegen.generate_module(module);
         codegen.output
     } else {
         let mut codegen = X86CodeGen::new();
+        codegen.regalloc = regalloc_results;
         codegen.generate_module(module);
         codegen.output
     }
@@ -46,10 +56,20 @@ fn escape_string_for_gas(s: &str) -> String {
 /// System V AMD64 ABI argument registers
 const X86_ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
 
+/// Callee-saved registers available for allocation (x86-64).
+/// These are saved/restored in prologue/epilogue when used.
+const X86_ALLOC_REGS: [&str; 5] = ["%rbx", "%r12", "%r13", "%r14", "%r15"];
+
 struct X86CodeGen {
     output: String,
     stack_slots: HashMap<VReg, i32>,
     stack_size: i32,
+    /// Register allocation results, keyed by function name.
+    regalloc: HashMap<String, RegAllocResult>,
+    /// Current function's allocation result.
+    current_alloc: Option<RegAllocResult>,
+    /// Which allocatable registers are actually used (for save/restore).
+    used_alloc_regs: Vec<u8>,
 }
 
 impl X86CodeGen {
@@ -58,7 +78,21 @@ impl X86CodeGen {
             output: String::new(),
             stack_slots: HashMap::new(),
             stack_size: 0,
+            regalloc: HashMap::new(),
+            current_alloc: None,
+            used_alloc_regs: Vec::new(),
         }
+    }
+
+    /// Get the location for a vreg: either a physical register or a stack slot.
+    fn vreg_location(&mut self, vreg: VReg) -> Location {
+        if let Some(ref alloc) = self.current_alloc {
+            if let Some(&loc) = alloc.assignments.get(&vreg) {
+                return loc;
+            }
+        }
+        // Fallback: allocate a stack slot
+        Location::Spill(self.slot_for(vreg))
     }
 
     fn slot_for(&mut self, vreg: VReg) -> i32 {
@@ -69,6 +103,11 @@ impl X86CodeGen {
         let offset = -self.stack_size;
         self.stack_slots.insert(vreg, offset);
         offset
+    }
+
+    /// Get the x86-64 register name for an allocatable register index.
+    fn alloc_reg_name(idx: u8) -> &'static str {
+        X86_ALLOC_REGS[idx as usize]
     }
 
     fn emit_line(&mut self, line: &str) {
@@ -89,8 +128,15 @@ impl X86CodeGen {
                 self.emit_line(&format!("movq ${}, %rax", val));
             }
             Operand::VReg(vreg) => {
-                let offset = self.slot_for(*vreg);
-                self.emit_line(&format!("movq {}(%rbp), %rax", offset));
+                let loc = self.vreg_location(*vreg);
+                match loc {
+                    Location::Reg(idx) => {
+                        self.emit_line(&format!("movq {}, %rax", Self::alloc_reg_name(idx)));
+                    }
+                    Location::Spill(offset) => {
+                        self.emit_line(&format!("movq {}(%rbp), %rax", offset));
+                    }
+                }
             }
         }
     }
@@ -101,15 +147,29 @@ impl X86CodeGen {
                 self.emit_line(&format!("movq ${}, %rcx", val));
             }
             Operand::VReg(vreg) => {
-                let offset = self.slot_for(*vreg);
-                self.emit_line(&format!("movq {}(%rbp), %rcx", offset));
+                let loc = self.vreg_location(*vreg);
+                match loc {
+                    Location::Reg(idx) => {
+                        self.emit_line(&format!("movq {}, %rcx", Self::alloc_reg_name(idx)));
+                    }
+                    Location::Spill(offset) => {
+                        self.emit_line(&format!("movq {}(%rbp), %rcx", offset));
+                    }
+                }
             }
         }
     }
 
     fn store_rax(&mut self, vreg: VReg) {
-        let offset = self.slot_for(vreg);
-        self.emit_line(&format!("movq %rax, {}(%rbp)", offset));
+        let loc = self.vreg_location(vreg);
+        match loc {
+            Location::Reg(idx) => {
+                self.emit_line(&format!("movq %rax, {}", Self::alloc_reg_name(idx)));
+            }
+            Location::Spill(offset) => {
+                self.emit_line(&format!("movq %rax, {}(%rbp)", offset));
+            }
+        }
     }
 
     fn generate_module(&mut self, module: &Module) {
@@ -134,27 +194,112 @@ impl X86CodeGen {
     fn generate_function(&mut self, func: &Function) {
         self.stack_slots.clear();
         self.stack_size = 0;
+        self.used_alloc_regs.clear();
 
-        for vreg in 0..func.num_vregs {
-            self.slot_for(vreg);
+        // Set up register allocation for this function
+        self.current_alloc = self.regalloc.remove(&func.name);
+
+        // Extract allocation data to avoid borrow conflicts
+        let (used_regs, spill_data, reg_assigned_vregs) =
+            if let Some(ref alloc) = self.current_alloc {
+                let mut used: Vec<u8> = alloc
+                    .assignments
+                    .values()
+                    .filter_map(|loc| {
+                        if let Location::Reg(idx) = loc {
+                            Some(*idx)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                used.sort_unstable();
+                used.dedup();
+
+                let spills: Vec<(VReg, i32)> = alloc
+                    .assignments
+                    .iter()
+                    .filter_map(|(&vreg, loc)| {
+                        if let Location::Spill(offset) = loc {
+                            Some((vreg, *offset))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let reg_assigned: Vec<VReg> = alloc
+                    .assignments
+                    .iter()
+                    .filter_map(|(&vreg, loc)| {
+                        if matches!(loc, Location::Reg(_)) {
+                            Some(vreg)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                (used, spills, reg_assigned)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+        self.used_alloc_regs = used_regs;
+
+        // Pre-allocate stack slots for spilled vregs
+        for (vreg, offset) in spill_data {
+            self.stack_slots.insert(vreg, offset);
+            let abs_offset = -offset;
+            if abs_offset > self.stack_size {
+                self.stack_size = abs_offset;
+            }
         }
 
-        let aligned_stack = (self.stack_size + 15) & !15;
+        // Allocate stack slots for vregs not covered by regalloc
+        for vreg in 0..func.num_vregs {
+            if !self.stack_slots.contains_key(&vreg) && !reg_assigned_vregs.contains(&vreg) {
+                self.slot_for(vreg);
+            }
+        }
+
+        // Account for saving callee-saved registers (pushed before frame setup)
+        let num_saved = self.used_alloc_regs.len() as i32;
+        let total_stack = self.stack_size + num_saved * 8;
+        let aligned_stack = (total_stack + 15) & !15;
+        // Adjust: actual stack allocation is aligned minus the pushed regs
+        let stack_alloc = aligned_stack - num_saved * 8;
 
         self.emit_raw(&format!("    .globl {}", func.name));
         self.emit_label(&func.name);
 
-        self.emit_line("pushq %rbp");
-        self.emit_line("movq %rsp, %rbp");
-        if aligned_stack > 0 {
-            self.emit_line(&format!("subq ${}, %rsp", aligned_stack));
+        // Prologue: push callee-saved registers first
+        for &reg_idx in &self.used_alloc_regs.clone() {
+            self.emit_line(&format!("pushq {}", Self::alloc_reg_name(reg_idx)));
         }
 
+        self.emit_line("pushq %rbp");
+        self.emit_line("movq %rsp, %rbp");
+        if stack_alloc > 0 {
+            self.emit_line(&format!("subq ${}, %rsp", stack_alloc));
+        }
+
+        // Save arguments to their locations (register or stack)
         for (i, param_name) in func.params.iter().enumerate() {
             if i < X86_ARG_REGS.len() && !param_name.is_empty() {
                 if let Some(&vreg) = func.locals.get(param_name) {
-                    let offset = self.slot_for(vreg);
-                    self.emit_line(&format!("movq {}, {}(%rbp)", X86_ARG_REGS[i], offset));
+                    let loc = self.vreg_location(vreg);
+                    match loc {
+                        Location::Reg(idx) => {
+                            self.emit_line(&format!(
+                                "movq {}, {}",
+                                X86_ARG_REGS[i],
+                                Self::alloc_reg_name(idx)
+                            ));
+                        }
+                        Location::Spill(offset) => {
+                            self.emit_line(&format!("movq {}, {}(%rbp)", X86_ARG_REGS[i], offset));
+                        }
+                    }
                 }
             }
         }
@@ -162,6 +307,9 @@ impl X86CodeGen {
         for block in &func.blocks {
             self.generate_block(block, &func.name);
         }
+
+        // current_alloc is consumed by this function
+        self.current_alloc = None;
     }
 
     fn generate_block(&mut self, block: &BasicBlock, func_name: &str) {
@@ -276,14 +424,28 @@ impl X86CodeGen {
             }
             Instruction::Store { addr, value } => {
                 self.load_operand_rax(value);
-                let addr_offset = self.slot_for(*addr);
-                self.emit_line(&format!("movq {}(%rbp), %rcx", addr_offset));
-                self.emit_line("movq %rax, (%rcx)");
+                let loc = self.vreg_location(*addr);
+                match loc {
+                    Location::Reg(idx) => {
+                        self.emit_line(&format!("movq %rax, ({})", Self::alloc_reg_name(idx)));
+                    }
+                    Location::Spill(offset) => {
+                        self.emit_line(&format!("movq {}(%rbp), %rcx", offset));
+                        self.emit_line("movq %rax, (%rcx)");
+                    }
+                }
             }
             Instruction::Load { dest, addr } => {
-                let addr_offset = self.slot_for(*addr);
-                self.emit_line(&format!("movq {}(%rbp), %rax", addr_offset));
-                self.emit_line("movq (%rax), %rax");
+                let loc = self.vreg_location(*addr);
+                match loc {
+                    Location::Reg(idx) => {
+                        self.emit_line(&format!("movq ({}), %rax", Self::alloc_reg_name(idx)));
+                    }
+                    Location::Spill(offset) => {
+                        self.emit_line(&format!("movq {}(%rbp), %rax", offset));
+                        self.emit_line("movq (%rax), %rax");
+                    }
+                }
                 self.store_rax(*dest);
             }
         }
@@ -295,8 +457,13 @@ impl X86CodeGen {
                 if let Some(val) = val {
                     self.load_operand_rax(val);
                 }
+                // Epilogue: restore stack, callee-saved regs
                 self.emit_line("movq %rbp, %rsp");
                 self.emit_line("popq %rbp");
+                // Restore callee-saved registers in reverse order
+                for &reg_idx in self.used_alloc_regs.clone().iter().rev() {
+                    self.emit_line(&format!("popq {}", Self::alloc_reg_name(reg_idx)));
+                }
                 self.emit_line("ret");
             }
             Terminator::Jump(label) => {
@@ -324,12 +491,23 @@ impl X86CodeGen {
 /// AAPCS64: first 8 integer args in x0-x7
 const AARCH64_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
 
+/// Callee-saved registers available for allocation (AArch64).
+const AARCH64_ALLOC_REGS: [&str; 10] = [
+    "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
+];
+
 struct Aarch64CodeGen {
     output: String,
     /// Map from vreg to stack offset (positive from sp)
     stack_slots: HashMap<VReg, i32>,
     /// Total stack frame size (including saved fp/lr)
     stack_size: i32,
+    /// Register allocation results, keyed by function name.
+    regalloc: HashMap<String, RegAllocResult>,
+    /// Current function's allocation result.
+    current_alloc: Option<RegAllocResult>,
+    /// Which allocatable registers are actually used (for save/restore).
+    used_alloc_regs: Vec<u8>,
 }
 
 impl Aarch64CodeGen {
@@ -338,7 +516,20 @@ impl Aarch64CodeGen {
             output: String::new(),
             stack_slots: HashMap::new(),
             stack_size: 16, // Reserve 16 bytes for saved fp (x29) and lr (x30)
+            regalloc: HashMap::new(),
+            current_alloc: None,
+            used_alloc_regs: Vec::new(),
         }
+    }
+
+    /// Get the location for a vreg: either a physical register or a stack slot.
+    fn vreg_location(&mut self, vreg: VReg) -> Location {
+        if let Some(ref alloc) = self.current_alloc {
+            if let Some(&loc) = alloc.assignments.get(&vreg) {
+                return loc;
+            }
+        }
+        Location::Spill(self.slot_for(vreg))
     }
 
     fn slot_for(&mut self, vreg: VReg) -> i32 {
@@ -349,6 +540,11 @@ impl Aarch64CodeGen {
         self.stack_size += 8;
         self.stack_slots.insert(vreg, offset);
         offset
+    }
+
+    /// Get the AArch64 register name for an allocatable register index.
+    fn alloc_reg_name(idx: u8) -> &'static str {
+        AARCH64_ALLOC_REGS[idx as usize]
     }
 
     fn emit_line(&mut self, line: &str) {
@@ -370,8 +566,15 @@ impl Aarch64CodeGen {
                 self.load_immediate("x0", *val);
             }
             Operand::VReg(vreg) => {
-                let offset = self.slot_for(*vreg);
-                self.emit_line(&format!("ldr x0, [x29, #{}]", offset));
+                let loc = self.vreg_location(*vreg);
+                match loc {
+                    Location::Reg(idx) => {
+                        self.emit_line(&format!("mov x0, {}", Self::alloc_reg_name(idx)));
+                    }
+                    Location::Spill(offset) => {
+                        self.emit_line(&format!("ldr x0, [x29, #{}]", offset));
+                    }
+                }
             }
         }
     }
@@ -383,8 +586,15 @@ impl Aarch64CodeGen {
                 self.load_immediate("x1", *val);
             }
             Operand::VReg(vreg) => {
-                let offset = self.slot_for(*vreg);
-                self.emit_line(&format!("ldr x1, [x29, #{}]", offset));
+                let loc = self.vreg_location(*vreg);
+                match loc {
+                    Location::Reg(idx) => {
+                        self.emit_line(&format!("mov x1, {}", Self::alloc_reg_name(idx)));
+                    }
+                    Location::Spill(offset) => {
+                        self.emit_line(&format!("ldr x1, [x29, #{}]", offset));
+                    }
+                }
             }
         }
     }
@@ -421,10 +631,17 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Store x0 to a vreg's stack slot (use x29/fp for stability across calls)
+    /// Store x0 to a vreg's location (register or stack slot)
     fn store_x0(&mut self, vreg: VReg) {
-        let offset = self.slot_for(vreg);
-        self.emit_line(&format!("str x0, [x29, #{}]", offset));
+        let loc = self.vreg_location(vreg);
+        match loc {
+            Location::Reg(idx) => {
+                self.emit_line(&format!("mov {}, x0", Self::alloc_reg_name(idx)));
+            }
+            Location::Spill(offset) => {
+                self.emit_line(&format!("str x0, [x29, #{}]", offset));
+            }
+        }
     }
 
     fn generate_module(&mut self, module: &Module) {
@@ -449,10 +666,73 @@ impl Aarch64CodeGen {
     fn generate_function(&mut self, func: &Function) {
         self.stack_slots.clear();
         self.stack_size = 16; // Reset: 16 bytes for fp + lr
+        self.used_alloc_regs.clear();
 
-        // Pre-allocate all vreg stack slots
-        for vreg in 0..func.num_vregs {
+        // Set up register allocation for this function
+        self.current_alloc = self.regalloc.remove(&func.name);
+
+        // Determine which allocatable registers are actually used and collect spill vregs
+        let (used_regs, spill_vregs, reg_assigned_vregs) =
+            if let Some(ref alloc) = self.current_alloc {
+                let mut used: Vec<u8> = alloc
+                    .assignments
+                    .values()
+                    .filter_map(|loc| {
+                        if let Location::Reg(idx) = loc {
+                            Some(*idx)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                used.sort_unstable();
+                used.dedup();
+
+                let spills: Vec<VReg> = alloc
+                    .assignments
+                    .iter()
+                    .filter_map(|(&vreg, loc)| {
+                        if matches!(loc, Location::Spill(_)) {
+                            Some(vreg)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let reg_assigned: Vec<VReg> = alloc
+                    .assignments
+                    .iter()
+                    .filter_map(|(&vreg, loc)| {
+                        if matches!(loc, Location::Reg(_)) {
+                            Some(vreg)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                (used, spills, reg_assigned)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+        self.used_alloc_regs = used_regs;
+
+        // Pre-allocate spill slots
+        for vreg in spill_vregs {
             self.slot_for(vreg);
+        }
+
+        // Reserve space for saving callee-saved regs (pairs of 16 bytes)
+        let num_saved = self.used_alloc_regs.len();
+        let save_size = num_saved.div_ceil(2) * 16; // Round up to pairs
+        self.stack_size += save_size as i32;
+
+        // Allocate stack slots for vregs not covered by regalloc
+        for vreg in 0..func.num_vregs {
+            if !self.stack_slots.contains_key(&vreg) && !reg_assigned_vregs.contains(&vreg) {
+                self.slot_for(vreg);
+            }
         }
 
         // Align stack to 16 bytes
@@ -466,12 +746,38 @@ impl Aarch64CodeGen {
         self.emit_line("stp x29, x30, [sp]");
         self.emit_line("mov x29, sp");
 
-        // Save arguments to stack slots
+        // Save callee-saved registers that we use
+        let save_base = aligned_stack - save_size as i32;
+        let used_regs = self.used_alloc_regs.clone();
+        for (i, &reg_idx) in used_regs.iter().enumerate() {
+            let offset = save_base + (i as i32) * 8;
+            self.emit_line(&format!(
+                "str {}, [sp, #{}]",
+                Self::alloc_reg_name(reg_idx),
+                offset
+            ));
+        }
+
+        // Save arguments to their locations
         for (i, param_name) in func.params.iter().enumerate() {
             if i < AARCH64_ARG_REGS.len() && !param_name.is_empty() {
                 if let Some(&vreg) = func.locals.get(param_name) {
-                    let offset = self.slot_for(vreg);
-                    self.emit_line(&format!("str {}, [x29, #{}]", AARCH64_ARG_REGS[i], offset));
+                    let loc = self.vreg_location(vreg);
+                    match loc {
+                        Location::Reg(idx) => {
+                            self.emit_line(&format!(
+                                "mov {}, {}",
+                                Self::alloc_reg_name(idx),
+                                AARCH64_ARG_REGS[i]
+                            ));
+                        }
+                        Location::Spill(offset) => {
+                            self.emit_line(&format!(
+                                "str {}, [x29, #{}]",
+                                AARCH64_ARG_REGS[i], offset
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -480,6 +786,8 @@ impl Aarch64CodeGen {
         for block in &func.blocks {
             self.generate_block(block, &func.name);
         }
+
+        self.current_alloc = None;
     }
 
     fn generate_block(&mut self, block: &BasicBlock, func_name: &str) {
@@ -614,14 +922,28 @@ impl Aarch64CodeGen {
             }
             Instruction::Store { addr, value } => {
                 self.load_operand_x0(value);
-                let addr_offset = self.slot_for(*addr);
-                self.emit_line(&format!("ldr x1, [x29, #{}]", addr_offset));
-                self.emit_line("str x0, [x1]");
+                let loc = self.vreg_location(*addr);
+                match loc {
+                    Location::Reg(idx) => {
+                        self.emit_line(&format!("str x0, [{}]", Self::alloc_reg_name(idx)));
+                    }
+                    Location::Spill(offset) => {
+                        self.emit_line(&format!("ldr x1, [x29, #{}]", offset));
+                        self.emit_line("str x0, [x1]");
+                    }
+                }
             }
             Instruction::Load { dest, addr } => {
-                let addr_offset = self.slot_for(*addr);
-                self.emit_line(&format!("ldr x0, [x29, #{}]", addr_offset));
-                self.emit_line("ldr x0, [x0]");
+                let loc = self.vreg_location(*addr);
+                match loc {
+                    Location::Reg(idx) => {
+                        self.emit_line(&format!("ldr x0, [{}]", Self::alloc_reg_name(idx)));
+                    }
+                    Location::Spill(offset) => {
+                        self.emit_line(&format!("ldr x0, [x29, #{}]", offset));
+                        self.emit_line("ldr x0, [x0]");
+                    }
+                }
                 self.store_x0(*dest);
             }
         }
@@ -633,9 +955,21 @@ impl Aarch64CodeGen {
                 if let Some(val) = val {
                     self.load_operand_x0(val);
                 }
+                // Restore callee-saved registers
+                let aligned_stack = (self.stack_size + 15) & !15;
+                let num_saved = self.used_alloc_regs.len();
+                let save_size = num_saved.div_ceil(2) * 16;
+                let save_base = aligned_stack - save_size as i32;
+                for (i, &reg_idx) in self.used_alloc_regs.clone().iter().enumerate() {
+                    let offset = save_base + (i as i32) * 8;
+                    self.emit_line(&format!(
+                        "ldr {}, [sp, #{}]",
+                        Self::alloc_reg_name(reg_idx),
+                        offset
+                    ));
+                }
                 // Epilogue: restore fp, lr, deallocate frame
                 self.emit_line("ldp x29, x30, [sp]");
-                let aligned_stack = (self.stack_size + 15) & !15;
                 self.emit_line(&format!("add sp, sp, #{}", aligned_stack));
                 self.emit_line("ret");
             }
