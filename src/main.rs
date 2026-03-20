@@ -3,6 +3,7 @@ mod ir;
 mod lexer;
 mod parser;
 mod preprocessor;
+mod sema;
 
 use std::env;
 use std::fs;
@@ -101,6 +102,21 @@ fn main() {
             process::exit(1);
         }
     };
+
+    // Semantic analysis
+    match sema::analyze(&program) {
+        Ok(warnings) => {
+            for w in &warnings {
+                eprintln!("Warning: {}", w);
+            }
+        }
+        Err(errors) => {
+            for e in &errors {
+                eprintln!("Semantic error: {}", e);
+            }
+            process::exit(1);
+        }
+    }
 
     // Lower to IR
     let ir_module = ir::lower(&program);

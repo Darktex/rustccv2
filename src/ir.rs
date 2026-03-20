@@ -247,6 +247,9 @@ impl IrBuilder {
                 Declaration::GlobalVar(_) => {
                     // TODO: global variables
                 }
+                Declaration::Typedef(_, _) | Declaration::StructDecl(_) => {
+                    // Type declarations don't generate IR
+                }
             }
         }
     }
@@ -849,11 +852,22 @@ impl IrBuilder {
             }
             Expr::Sizeof(ty) => {
                 let size = match ty.as_ref() {
-                    TypeSpec::Char => 1,
-                    TypeSpec::Short => 2,
-                    TypeSpec::Int => 4,
-                    TypeSpec::Long => 8,
-                    TypeSpec::Pointer(_) => 8,
+                    TypeSpec::Char | TypeSpec::SignedChar | TypeSpec::UnsignedChar => 1,
+                    TypeSpec::Short | TypeSpec::UnsignedShort => 2,
+                    TypeSpec::Int | TypeSpec::UnsignedInt => 4,
+                    TypeSpec::Long | TypeSpec::UnsignedLong => 8,
+                    TypeSpec::Pointer(_) | TypeSpec::FunctionPointer { .. } => 8,
+                    TypeSpec::Array(elem_ty, Some(count)) => {
+                        let elem_size = match elem_ty.as_ref() {
+                            TypeSpec::Char | TypeSpec::SignedChar | TypeSpec::UnsignedChar => 1,
+                            TypeSpec::Short | TypeSpec::UnsignedShort => 2,
+                            TypeSpec::Int | TypeSpec::UnsignedInt => 4,
+                            TypeSpec::Long | TypeSpec::UnsignedLong => 8,
+                            TypeSpec::Pointer(_) => 8,
+                            _ => 4,
+                        };
+                        elem_size * *count as i64
+                    }
                     _ => 4,
                 };
                 Operand::Immediate(size)
