@@ -191,6 +191,12 @@ impl FunctionBuilder {
     }
 
     fn start_block(&mut self, label: Label) {
+        // If the current block hasn't been terminated yet (e.g., an unreachable
+        // merge block after if/else where both branches return), emit it now
+        // with an implicit return so all labels are defined in the output.
+        if !self.blocks.iter().any(|b| b.label == self.current_label) {
+            self.terminate(Terminator::Return(Some(Operand::Immediate(0))));
+        }
         self.current_label = label;
         self.current_block = Vec::new();
     }
