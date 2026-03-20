@@ -196,10 +196,10 @@ impl FunctionBuilder {
     }
 
     fn finish(mut self) -> Function {
-        // If current block has instructions but no terminator, add implicit return
-        if !self.current_block.is_empty() {
-            self.terminate(Terminator::Return(Some(Operand::Immediate(0))));
-        }
+        // Always finalize the current block — even if it's empty, it may be
+        // a branch target that other blocks jump to.  Give it an implicit
+        // return so the assembler always finds the label.
+        self.terminate(Terminator::Return(Some(Operand::Immediate(0))));
         Function {
             name: self.name,
             params: self.params,
