@@ -1,4 +1,4 @@
-/// x86-64 code generator (AT&T syntax).
+/// Code generator with x86-64 and AArch64 backends.
 /// Naive: every virtual register gets a stack slot.
 use crate::ir::{
     BasicBlock, CmpOp, Function, Instruction, IrBinOp, IrUnaryOp, Module, Operand, Terminator, VReg,
@@ -6,19 +6,55 @@ use crate::ir::{
 use std::collections::HashMap;
 use std::fmt::Write;
 
-/// System V AMD64 ABI argument registers
-const ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+/// Dispatch to the appropriate backend based on target architecture.
+pub fn generate(module: &Module) -> String {
+    if cfg!(target_arch = "aarch64") {
+        let mut codegen = Aarch64CodeGen::new();
+        codegen.generate_module(module);
+        codegen.output
+    } else {
+        let mut codegen = X86CodeGen::new();
+        codegen.generate_module(module);
+        codegen.output
+    }
+}
 
-struct CodeGen {
+fn escape_string_for_gas(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            '\n' => result.push_str("\\n"),
+            '\t' => result.push_str("\\t"),
+            '\r' => result.push_str("\\r"),
+            '\\' => result.push_str("\\\\"),
+            '"' => result.push_str("\\\""),
+            '\0' => result.push_str("\\0"),
+            c if c.is_ascii_graphic() || c == ' ' => result.push(c),
+            c => {
+                let b = c as u32;
+                write!(result, "\\{:03o}", b).unwrap();
+            }
+        }
+    }
+    result
+}
+
+// ============================================================================
+// x86-64 Code Generator (AT&T syntax, System V AMD64 ABI)
+// ============================================================================
+
+/// System V AMD64 ABI argument registers
+const X86_ARG_REGS: [&str; 6] = ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"];
+
+struct X86CodeGen {
     output: String,
-    /// Map from vreg to stack offset (negative from rbp)
     stack_slots: HashMap<VReg, i32>,
     stack_size: i32,
 }
 
-impl CodeGen {
+impl X86CodeGen {
     fn new() -> Self {
-        CodeGen {
+        X86CodeGen {
             output: String::new(),
             stack_slots: HashMap::new(),
             stack_size: 0,
@@ -47,7 +83,6 @@ impl CodeGen {
         writeln!(self.output, "{}", line).unwrap();
     }
 
-    /// Load an operand into %rax
     fn load_operand_rax(&mut self, op: &Operand) {
         match op {
             Operand::Immediate(val) => {
@@ -60,7 +95,6 @@ impl CodeGen {
         }
     }
 
-    /// Load an operand into %rcx
     fn load_operand_rcx(&mut self, op: &Operand) {
         match op {
             Operand::Immediate(val) => {
@@ -73,19 +107,16 @@ impl CodeGen {
         }
     }
 
-    /// Store %rax to a vreg's stack slot
     fn store_rax(&mut self, vreg: VReg) {
         let offset = self.slot_for(vreg);
         self.emit_line(&format!("movq %rax, {}(%rbp)", offset));
     }
 
     fn generate_module(&mut self, module: &Module) {
-        // String literals in .rodata
         if !module.string_literals.is_empty() {
             self.emit_raw("    .section .rodata");
             for (label, value) in &module.string_literals {
                 self.emit_label(label);
-                // Emit as escaped string
                 let escaped = escape_string_for_gas(value);
                 self.emit_line(&format!(".string \"{}\"", escaped));
             }
@@ -104,35 +135,30 @@ impl CodeGen {
         self.stack_slots.clear();
         self.stack_size = 0;
 
-        // Pre-allocate all vreg stack slots
         for vreg in 0..func.num_vregs {
             self.slot_for(vreg);
         }
 
-        // Align stack to 16 bytes
         let aligned_stack = (self.stack_size + 15) & !15;
 
         self.emit_raw(&format!("    .globl {}", func.name));
         self.emit_label(&func.name);
 
-        // Prologue
         self.emit_line("pushq %rbp");
         self.emit_line("movq %rsp, %rbp");
         if aligned_stack > 0 {
             self.emit_line(&format!("subq ${}, %rsp", aligned_stack));
         }
 
-        // Save arguments to stack slots
         for (i, param_name) in func.params.iter().enumerate() {
-            if i < ARG_REGS.len() && !param_name.is_empty() {
+            if i < X86_ARG_REGS.len() && !param_name.is_empty() {
                 if let Some(&vreg) = func.locals.get(param_name) {
                     let offset = self.slot_for(vreg);
-                    self.emit_line(&format!("movq {}, {}(%rbp)", ARG_REGS[i], offset));
+                    self.emit_line(&format!("movq {}, {}(%rbp)", X86_ARG_REGS[i], offset));
                 }
             }
         }
 
-        // Generate basic blocks
         for block in &func.blocks {
             self.generate_block(block, &func.name);
         }
@@ -167,24 +193,19 @@ impl CodeGen {
                     IrBinOp::Sub => self.emit_line("subq %rcx, %rax"),
                     IrBinOp::Mul => self.emit_line("imulq %rcx, %rax"),
                     IrBinOp::Div => {
-                        self.emit_line("cqto"); // sign-extend rax into rdx:rax
+                        self.emit_line("cqto");
                         self.emit_line("idivq %rcx");
                     }
                     IrBinOp::Mod => {
                         self.emit_line("cqto");
                         self.emit_line("idivq %rcx");
-                        self.emit_line("movq %rdx, %rax"); // remainder in rdx
+                        self.emit_line("movq %rdx, %rax");
                     }
                     IrBinOp::And => self.emit_line("andq %rcx, %rax"),
                     IrBinOp::Or => self.emit_line("orq %rcx, %rax"),
                     IrBinOp::Xor => self.emit_line("xorq %rcx, %rax"),
-                    IrBinOp::Shl => {
-                        // shift amount must be in %cl
-                        self.emit_line("shlq %cl, %rax");
-                    }
-                    IrBinOp::Shr => {
-                        self.emit_line("sarq %cl, %rax");
-                    }
+                    IrBinOp::Shl => self.emit_line("shlq %cl, %rax"),
+                    IrBinOp::Shr => self.emit_line("sarq %cl, %rax"),
                 }
                 self.store_rax(*dest);
             }
@@ -227,44 +248,19 @@ impl CodeGen {
                 self.store_rax(*dest);
             }
             Instruction::Call { dest, func, args } => {
-                // Push args into argument registers (System V ABI)
-                // Need to be careful about register clobbering
-                // First, push all args to stack, then pop into arg regs
-                let num_reg_args = args.len().min(ARG_REGS.len());
-
-                // Evaluate and store args on stack temporarily
-                let mut arg_temps = Vec::new();
                 for arg in args {
                     self.load_operand_rax(arg);
                     self.emit_line("pushq %rax");
-                    arg_temps.push(());
                 }
-
-                // Pop into arg registers in reverse order
                 for i in (0..args.len()).rev() {
-                    if i < ARG_REGS.len() {
-                        self.emit_line(&format!("popq {}", ARG_REGS[i]));
+                    if i < X86_ARG_REGS.len() {
+                        self.emit_line(&format!("popq {}", X86_ARG_REGS[i]));
                     } else {
-                        // Stack args stay on stack - but we need to handle this properly
-                        // For now, just pop and discard extras
                         self.emit_line("popq %rax");
                     }
                 }
-
-                // For variadic functions (like printf), set %al = number of vector args (0)
                 self.emit_line("xorl %eax, %eax");
-
-                // Align stack to 16 bytes before call if needed
-                // The stack is already 16-byte aligned after prologue if we haven't pushed odd items
-                let stack_args = if args.len() > ARG_REGS.len() {
-                    args.len() - ARG_REGS.len()
-                } else {
-                    0
-                };
-                let _ = (stack_args, num_reg_args, arg_temps);
-
                 self.emit_line(&format!("call {}", func));
-
                 if let Some(dest) = dest {
                     self.store_rax(*dest);
                 }
@@ -316,38 +312,339 @@ impl CodeGen {
                 self.emit_line(&format!("jne .L{}_{}", func_name, true_label));
                 self.emit_line(&format!("jmp .L{}_{}", func_name, false_label));
             }
-            Terminator::None => {
-                // Should not happen in well-formed IR
-            }
+            Terminator::None => {}
         }
     }
 }
 
-fn escape_string_for_gas(s: &str) -> String {
-    let mut result = String::new();
-    for c in s.chars() {
-        match c {
-            '\n' => result.push_str("\\n"),
-            '\t' => result.push_str("\\t"),
-            '\r' => result.push_str("\\r"),
-            '\\' => result.push_str("\\\\"),
-            '"' => result.push_str("\\\""),
-            '\0' => result.push_str("\\0"),
-            c if c.is_ascii_graphic() || c == ' ' => result.push(c),
-            c => {
-                // Emit as octal escape
-                let b = c as u32;
-                write!(result, "\\{:03o}", b).unwrap();
+// ============================================================================
+// AArch64 Code Generator (AAPCS64)
+// ============================================================================
+
+/// AAPCS64: first 8 integer args in x0-x7
+const AARCH64_ARG_REGS: [&str; 8] = ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"];
+
+struct Aarch64CodeGen {
+    output: String,
+    /// Map from vreg to stack offset (positive from sp)
+    stack_slots: HashMap<VReg, i32>,
+    /// Total stack frame size (including saved fp/lr)
+    stack_size: i32,
+}
+
+impl Aarch64CodeGen {
+    fn new() -> Self {
+        Aarch64CodeGen {
+            output: String::new(),
+            stack_slots: HashMap::new(),
+            stack_size: 16, // Reserve 16 bytes for saved fp (x29) and lr (x30)
+        }
+    }
+
+    fn slot_for(&mut self, vreg: VReg) -> i32 {
+        if let Some(&offset) = self.stack_slots.get(&vreg) {
+            return offset;
+        }
+        let offset = self.stack_size;
+        self.stack_size += 8;
+        self.stack_slots.insert(vreg, offset);
+        offset
+    }
+
+    fn emit_line(&mut self, line: &str) {
+        writeln!(self.output, "    {}", line).unwrap();
+    }
+
+    fn emit_label(&mut self, label: &str) {
+        writeln!(self.output, "{}:", label).unwrap();
+    }
+
+    fn emit_raw(&mut self, line: &str) {
+        writeln!(self.output, "{}", line).unwrap();
+    }
+
+    /// Load an operand into x0
+    fn load_operand_x0(&mut self, op: &Operand) {
+        match op {
+            Operand::Immediate(val) => {
+                self.load_immediate("x0", *val);
+            }
+            Operand::VReg(vreg) => {
+                let offset = self.slot_for(*vreg);
+                self.emit_line(&format!("ldr x0, [sp, #{}]", offset));
             }
         }
     }
-    result
-}
 
-pub fn generate(module: &Module) -> String {
-    let mut codegen = CodeGen::new();
-    codegen.generate_module(module);
-    codegen.output
+    /// Load an operand into x1
+    fn load_operand_x1(&mut self, op: &Operand) {
+        match op {
+            Operand::Immediate(val) => {
+                self.load_immediate("x1", *val);
+            }
+            Operand::VReg(vreg) => {
+                let offset = self.slot_for(*vreg);
+                self.emit_line(&format!("ldr x1, [sp, #{}]", offset));
+            }
+        }
+    }
+
+    /// Load an immediate value into a register (handles large constants)
+    fn load_immediate(&mut self, reg: &str, val: i64) {
+        if (-65536..=65535).contains(&val) {
+            self.emit_line(&format!("mov {}, #{}", reg, val));
+        } else {
+            // Large constants: use movz + movk sequence
+            let uval = val as u64;
+            self.emit_line(&format!("movz {}, #0x{:x}", reg, uval & 0xFFFF));
+            if (uval >> 16) & 0xFFFF != 0 {
+                self.emit_line(&format!(
+                    "movk {}, #0x{:x}, lsl #16",
+                    reg,
+                    (uval >> 16) & 0xFFFF
+                ));
+            }
+            if (uval >> 32) & 0xFFFF != 0 {
+                self.emit_line(&format!(
+                    "movk {}, #0x{:x}, lsl #32",
+                    reg,
+                    (uval >> 32) & 0xFFFF
+                ));
+            }
+            if (uval >> 48) & 0xFFFF != 0 {
+                self.emit_line(&format!(
+                    "movk {}, #0x{:x}, lsl #48",
+                    reg,
+                    (uval >> 48) & 0xFFFF
+                ));
+            }
+        }
+    }
+
+    /// Store x0 to a vreg's stack slot
+    fn store_x0(&mut self, vreg: VReg) {
+        let offset = self.slot_for(vreg);
+        self.emit_line(&format!("str x0, [sp, #{}]", offset));
+    }
+
+    fn generate_module(&mut self, module: &Module) {
+        if !module.string_literals.is_empty() {
+            self.emit_raw("    .section .rodata");
+            for (label, value) in &module.string_literals {
+                self.emit_label(label);
+                let escaped = escape_string_for_gas(value);
+                self.emit_line(&format!(".string \"{}\"", escaped));
+            }
+            self.emit_raw("");
+        }
+
+        self.emit_raw("    .text");
+        for func in &module.functions {
+            if func.is_defined {
+                self.generate_function(func);
+            }
+        }
+    }
+
+    fn generate_function(&mut self, func: &Function) {
+        self.stack_slots.clear();
+        self.stack_size = 16; // Reset: 16 bytes for fp + lr
+
+        // Pre-allocate all vreg stack slots
+        for vreg in 0..func.num_vregs {
+            self.slot_for(vreg);
+        }
+
+        // Align stack to 16 bytes
+        let aligned_stack = (self.stack_size + 15) & !15;
+
+        self.emit_raw(&format!("    .globl {}", func.name));
+        self.emit_label(&func.name);
+
+        // Prologue: allocate frame, save fp and lr
+        self.emit_line(&format!("sub sp, sp, #{}", aligned_stack));
+        self.emit_line("stp x29, x30, [sp]");
+        self.emit_line("mov x29, sp");
+
+        // Save arguments to stack slots
+        for (i, param_name) in func.params.iter().enumerate() {
+            if i < AARCH64_ARG_REGS.len() && !param_name.is_empty() {
+                if let Some(&vreg) = func.locals.get(param_name) {
+                    let offset = self.slot_for(vreg);
+                    self.emit_line(&format!("str {}, [sp, #{}]", AARCH64_ARG_REGS[i], offset));
+                }
+            }
+        }
+
+        // Generate basic blocks
+        for block in &func.blocks {
+            self.generate_block(block, &func.name);
+        }
+    }
+
+    fn generate_block(&mut self, block: &BasicBlock, func_name: &str) {
+        self.emit_label(&format!(".L{}_{}", func_name, block.label));
+
+        for inst in &block.instructions {
+            self.generate_instruction(inst);
+        }
+
+        self.generate_terminator(&block.terminator, func_name);
+    }
+
+    fn generate_instruction(&mut self, inst: &Instruction) {
+        match inst {
+            Instruction::LoadImm { dest, value } => {
+                self.load_immediate("x0", *value);
+                self.store_x0(*dest);
+            }
+            Instruction::BinOp {
+                dest,
+                op,
+                left,
+                right,
+            } => {
+                self.load_operand_x0(left);
+                self.load_operand_x1(right);
+                match op {
+                    IrBinOp::Add => self.emit_line("add x0, x0, x1"),
+                    IrBinOp::Sub => self.emit_line("sub x0, x0, x1"),
+                    IrBinOp::Mul => self.emit_line("mul x0, x0, x1"),
+                    IrBinOp::Div => self.emit_line("sdiv x0, x0, x1"),
+                    IrBinOp::Mod => {
+                        self.emit_line("sdiv x2, x0, x1");
+                        self.emit_line("msub x0, x2, x1, x0");
+                    }
+                    IrBinOp::And => self.emit_line("and x0, x0, x1"),
+                    IrBinOp::Or => self.emit_line("orr x0, x0, x1"),
+                    IrBinOp::Xor => self.emit_line("eor x0, x0, x1"),
+                    IrBinOp::Shl => self.emit_line("lsl x0, x0, x1"),
+                    IrBinOp::Shr => self.emit_line("asr x0, x0, x1"),
+                }
+                self.store_x0(*dest);
+            }
+            Instruction::UnaryOp { dest, op, operand } => {
+                self.load_operand_x0(operand);
+                match op {
+                    IrUnaryOp::Neg => self.emit_line("neg x0, x0"),
+                    IrUnaryOp::Not => {
+                        self.emit_line("cmp x0, #0");
+                        self.emit_line("cset x0, eq");
+                    }
+                    IrUnaryOp::BitwiseNot => self.emit_line("mvn x0, x0"),
+                }
+                self.store_x0(*dest);
+            }
+            Instruction::Cmp {
+                dest,
+                op,
+                left,
+                right,
+            } => {
+                self.load_operand_x0(left);
+                self.load_operand_x1(right);
+                self.emit_line("cmp x0, x1");
+                let cond = match op {
+                    CmpOp::Eq => "eq",
+                    CmpOp::Ne => "ne",
+                    CmpOp::Lt => "lt",
+                    CmpOp::Le => "le",
+                    CmpOp::Gt => "gt",
+                    CmpOp::Ge => "ge",
+                };
+                self.emit_line(&format!("cset x0, {}", cond));
+                self.store_x0(*dest);
+            }
+            Instruction::Copy { dest, src } => {
+                self.load_operand_x0(src);
+                self.store_x0(*dest);
+            }
+            Instruction::Call { dest, func, args } => {
+                // Load arguments into registers (AAPCS64)
+                // We need to be careful about clobbering, so save args to stack first
+                // then load into arg registers
+                let num_args = args.len().min(AARCH64_ARG_REGS.len());
+
+                // For simplicity with <= 8 args, evaluate each into a temp vreg-like
+                // location, then load into arg regs
+                let mut saved_offsets = Vec::new();
+                for arg in args.iter() {
+                    self.load_operand_x0(arg);
+                    // Save to a temporary location by pushing (AArch64 style)
+                    self.emit_line("str x0, [sp, #-16]!");
+                    saved_offsets.push(());
+                }
+
+                // Pop back into argument registers in reverse
+                for i in (0..args.len()).rev() {
+                    if i < AARCH64_ARG_REGS.len() {
+                        self.emit_line(&format!("ldr {}, [sp], #16", AARCH64_ARG_REGS[i]));
+                    } else {
+                        self.emit_line("ldr x9, [sp], #16"); // discard
+                    }
+                }
+
+                let _ = (num_args, saved_offsets);
+
+                self.emit_line(&format!("bl {}", func));
+
+                if let Some(dest) = dest {
+                    self.store_x0(*dest);
+                }
+            }
+            Instruction::LoadStringAddr { dest, label } => {
+                self.emit_line(&format!("adrp x0, {}", label));
+                self.emit_line(&format!("add x0, x0, :lo12:{}", label));
+                self.store_x0(*dest);
+            }
+            Instruction::Alloca { dest, size } => {
+                self.emit_line(&format!("sub sp, sp, #{}", size));
+                self.emit_line("mov x0, sp");
+                self.store_x0(*dest);
+            }
+            Instruction::Store { addr, value } => {
+                self.load_operand_x0(value);
+                let addr_offset = self.slot_for(*addr);
+                self.emit_line(&format!("ldr x1, [sp, #{}]", addr_offset));
+                self.emit_line("str x0, [x1]");
+            }
+            Instruction::Load { dest, addr } => {
+                let addr_offset = self.slot_for(*addr);
+                self.emit_line(&format!("ldr x0, [sp, #{}]", addr_offset));
+                self.emit_line("ldr x0, [x0]");
+                self.store_x0(*dest);
+            }
+        }
+    }
+
+    fn generate_terminator(&mut self, term: &Terminator, func_name: &str) {
+        match term {
+            Terminator::Return(val) => {
+                if let Some(val) = val {
+                    self.load_operand_x0(val);
+                }
+                // Epilogue: restore fp, lr, deallocate frame
+                self.emit_line("ldp x29, x30, [sp]");
+                let aligned_stack = (self.stack_size + 15) & !15;
+                self.emit_line(&format!("add sp, sp, #{}", aligned_stack));
+                self.emit_line("ret");
+            }
+            Terminator::Jump(label) => {
+                self.emit_line(&format!("b .L{}_{}", func_name, label));
+            }
+            Terminator::Branch {
+                condition,
+                true_label,
+                false_label,
+            } => {
+                self.load_operand_x0(condition);
+                self.emit_line("cmp x0, #0");
+                self.emit_line(&format!("b.ne .L{}_{}", func_name, true_label));
+                self.emit_line(&format!("b .L{}_{}", func_name, false_label));
+            }
+            Terminator::None => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -365,7 +662,7 @@ mod tests {
         let asm = generate(&module);
         assert!(asm.contains(".globl main"));
         assert!(asm.contains("main:"));
-        assert!(asm.contains("$42"));
+        assert!(asm.contains("42"));
         assert!(asm.contains("ret"));
     }
 
@@ -382,7 +679,37 @@ mod tests {
         let program = parser::parse(tokens).unwrap();
         let module = ir::lower(&program);
         let asm = generate(&module);
-        assert!(asm.contains("call printf"));
+        assert!(asm.contains("printf"));
         assert!(asm.contains("Hello, World!"));
+    }
+
+    #[test]
+    fn test_codegen_arithmetic() {
+        let tokens = lexer::lex("int main() { return 2 + 3 * 4; }").unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let module = ir::lower(&program);
+        let asm = generate(&module);
+        assert!(asm.contains("ret"));
+    }
+
+    #[test]
+    fn test_codegen_if_else() {
+        let source = "int main() { if (1 > 0) { return 1; } else { return 0; } }";
+        let tokens = lexer::lex(source).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let module = ir::lower(&program);
+        let asm = generate(&module);
+        assert!(asm.contains("cmp") || asm.contains("cmpq"));
+    }
+
+    #[test]
+    fn test_codegen_while_loop() {
+        let source = "int main() { int i = 0; while (i < 10) { i = i + 1; } return i; }";
+        let tokens = lexer::lex(source).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let module = ir::lower(&program);
+        let asm = generate(&module);
+        // Should have loop labels
+        assert!(asm.contains(".L"));
     }
 }
