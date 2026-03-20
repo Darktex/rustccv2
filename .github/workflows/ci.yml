@@ -1,0 +1,259 @@
+name: ci
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (build + test + lint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  integration:
+    name: Integration Tests (GCC Oracle)
+    runs-on: ubuntu-latest
+    needs: [rust]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GCC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build rustcc
+        run: cargo build --release
+
+      - name: Run integration tests
+        run: |
+          set -euo pipefail
+
+          RUSTCC="./target/release/rustcc"
+          PASS=0
+          FAIL=0
+          ERROR=0
+          TOTAL=0
+
+          for test_dir in tests/*/; do
+            [ -f "$test_dir/main.c" ] || continue
+            TOTAL=$((TOTAL + 1))
+            test_name=$(basename "$test_dir")
+
+            # Compile with GCC (oracle)
+            if ! gcc -o "/tmp/gcc_${test_name}" "$test_dir/main.c" 2>/dev/null; then
+              echo "ERROR: $test_name — GCC failed to compile"
+              ERROR=$((ERROR + 1))
+              continue
+            fi
+
+            # Compile with rustcc
+            if ! "$RUSTCC" -o "/tmp/rustcc_${test_name}" "$test_dir/main.c" 2>/dev/null; then
+              echo "FAIL: $test_name — rustcc failed to compile"
+              FAIL=$((FAIL + 1))
+              continue
+            fi
+
+            # Run both and capture output + exit code
+            gcc_out=$("/tmp/gcc_${test_name}" 2>&1) || true
+            gcc_rc=$?
+            rustcc_out=$("/tmp/rustcc_${test_name}" 2>&1) || true
+            rustcc_rc=$?
+
+            # Compare expected return code if specified
+            if [ -f "$test_dir/expected.ret" ]; then
+              expected_rc=$(cat "$test_dir/expected.ret" | tr -d '[:space:]')
+              if [ "$rustcc_rc" != "$expected_rc" ]; then
+                echo "FAIL: $test_name — exit code: expected=$expected_rc got=$rustcc_rc"
+                FAIL=$((FAIL + 1))
+                continue
+              fi
+            else
+              # Default: compare exit codes between gcc and rustcc
+              if [ "$gcc_rc" != "$rustcc_rc" ]; then
+                echo "FAIL: $test_name — exit code mismatch: gcc=$gcc_rc rustcc=$rustcc_rc"
+                FAIL=$((FAIL + 1))
+                continue
+              fi
+            fi
+
+            # Compare stdout if expected file exists, else diff with gcc
+            if [ -f "$test_dir/expected.stdout" ]; then
+              expected_out=$(cat "$test_dir/expected.stdout")
+              if [ "$rustcc_out" != "$expected_out" ]; then
+                echo "FAIL: $test_name — stdout mismatch with expected"
+                FAIL=$((FAIL + 1))
+                continue
+              fi
+            else
+              if [ "$gcc_out" != "$rustcc_out" ]; then
+                echo "FAIL: $test_name — stdout mismatch with gcc oracle"
+                FAIL=$((FAIL + 1))
+                continue
+              fi
+            fi
+
+            echo "PASS: $test_name"
+            PASS=$((PASS + 1))
+          done
+
+          echo ""
+          echo "=============================="
+          echo "PASS: $PASS/$TOTAL ($(( TOTAL > 0 ? PASS * 100 / TOTAL : 0 ))%)"
+          echo "FAIL: $FAIL | ERROR: $ERROR"
+          echo "=============================="
+
+          if [ "$FAIL" -gt 0 ] || [ "$ERROR" -gt 0 ]; then
+            exit 1
+          fi
+
+  torture:
+    name: GCC Torture Test Suite
+    runs-on: ubuntu-latest
+    needs: [rust]
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GCC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache GCC torture suite
+        uses: actions/cache@v4
+        with:
+          path: gcc-torture-tests/
+          key: gcc-torture-v1
+
+      - name: Download GCC torture tests
+        run: |
+          if [ ! -d "gcc-torture-tests" ]; then
+            git clone --depth 1 --filter=blob:none --sparse \
+              https://gcc.gnu.org/git/gcc.git gcc-torture-repo
+            cd gcc-torture-repo
+            git sparse-checkout set gcc/testsuite/gcc.c-torture/execute
+            cd ..
+            mkdir -p gcc-torture-tests
+            cp gcc-torture-repo/gcc/testsuite/gcc.c-torture/execute/*.c \
+              gcc-torture-tests/ 2>/dev/null || true
+            rm -rf gcc-torture-repo
+          fi
+          echo "Torture tests available: $(ls gcc-torture-tests/*.c 2>/dev/null | wc -l)"
+
+      - name: Build rustcc
+        run: cargo build --release
+
+      - name: Run torture tests
+        run: |
+          set -uo pipefail
+
+          RUSTCC="./target/release/rustcc"
+          PASS=0
+          FAIL=0
+          SKIP=0
+          TOTAL=0
+          TIMEOUT=300  # 5 minutes per test
+
+          for src in gcc-torture-tests/*.c; do
+            [ -f "$src" ] || continue
+            TOTAL=$((TOTAL + 1))
+            test_name=$(basename "$src" .c)
+
+            # Compile with rustcc
+            if ! timeout "$TIMEOUT" "$RUSTCC" -o "/tmp/torture_${test_name}" "$src" 2>/dev/null; then
+              SKIP=$((SKIP + 1))
+              continue
+            fi
+
+            # Run the compiled binary
+            if timeout "$TIMEOUT" "/tmp/torture_${test_name}" 2>/dev/null; then
+              PASS=$((PASS + 1))
+            else
+              FAIL=$((FAIL + 1))
+            fi
+
+            # Clean up binary
+            rm -f "/tmp/torture_${test_name}"
+          done
+
+          echo ""
+          echo "=============================="
+          echo "GCC Torture Test Results"
+          echo "=============================="
+          echo "TOTAL:   $TOTAL"
+          echo "PASS:    $PASS ($(( TOTAL > 0 ? PASS * 100 / TOTAL : 0 ))%)"
+          echo "FAIL:    $FAIL"
+          echo "SKIP:    $SKIP (compile failures)"
+          echo "=============================="
+
+          # Report pass rate but don't fail the job — torture tests are aspirational
+          echo "pass_rate=$(( TOTAL > 0 ? PASS * 100 / TOTAL : 0 ))" >> "$GITHUB_OUTPUT"
